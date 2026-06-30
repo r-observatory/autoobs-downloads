@@ -53,6 +53,27 @@ parse_stat_response <- function(txt) {
        cnt_30d = gi("cnt_30d"), cnt_total = gi("cnt_total"), first_seen = gi("first_seen"))
 }
 
+# Extract the repository paths from a MirrorCache /rest/search/package_locations
+# response (each entry carries a "path" like
+# "/repositories/devel:/languages:/R:/autoCRAN/openSUSE_Tumbleweed/x86_64").
+parse_location_paths <- function(txt) {
+  obj <- tryCatch(jsonlite::fromJSON(txt, simplifyVector = TRUE), error = function(e) NULL)
+  if (is.null(obj) || is.null(obj$data)) return(character(0))
+  d <- obj$data
+  if (is.data.frame(d)) return(as.character(d$path %||% character(0)))
+  if (is.list(d)) return(unlist(lapply(d, function(x) x$path), use.names = FALSE))
+  character(0)
+}
+
+# Decide whether a package is served ONLY by autoCRAN: 1 if every location path is
+# under an autoCRAN repo, 0 if any path is elsewhere (the distribution or another
+# devel:languages:R: project, so its name-aggregated count is a superset), NA when
+# no locations are known (cannot classify; left to retry on a later run).
+classify_autocran_only <- function(paths) {
+  if (length(paths) == 0) return(NA_integer_)
+  as.integer(all(grepl("autoCRAN", paths, fixed = TRUE)))
+}
+
 # Build the per-day daily rows from a stats frame: the day's count is cnt_1d (the
 # trailing-day download figure), attributed to `attribute_date` (the UTC day that
 # just completed). Zero/NA days are dropped to keep the long-tail series compact.
@@ -119,6 +140,7 @@ summary_table_ddl <- function(table) {
       rank_30d      INTEGER,
       rank_total    INTEGER,
       trend         REAL,
+      autocran_only INTEGER,
       first_seen    TEXT,
       last_snapshot TEXT,
       PRIMARY KEY (package))", table)
@@ -126,7 +148,7 @@ summary_table_ddl <- function(table) {
 
 SUMMARY_COLS <- c("package", "package_lower", "id", "total_1d", "total_7d", "total_30d",
                   "cnt_total", "avg_daily_30d", "rank_30d", "rank_total", "trend",
-                  "first_seen", "last_snapshot")
+                  "autocran_only", "first_seen", "last_snapshot")
 
 empty_summary <- function() {
   as.data.frame(setNames(lapply(SUMMARY_COLS, function(x) switch(x,
@@ -141,7 +163,8 @@ empty_summary <- function() {
 # series). `trend` compares the last 30 days of the locally-accumulated daily
 # series to the prior 30, so it is NULL until ~60 days of history exist. Ranks are
 # global (this project ships a single category of packages).
-build_summary <- function(daily_con, stats_df, anchor_date, snapshot_date) {
+build_summary <- function(daily_con, stats_df, anchor_date, snapshot_date,
+                          autocran_map = NULL) {
   if (nrow(stats_df) == 0) return(empty_summary())
   base <- data.frame(
     package       = stats_df$package,
@@ -169,6 +192,8 @@ build_summary <- function(daily_con, stats_df, anchor_date, snapshot_date) {
                     round((m$last30 / m$prev30 - 1) * 100, 2), NA_real_)
   m$rank_30d   <- as.integer(rank(-ifelse(is.na(m$total_30d), 0L, m$total_30d), ties.method = "min"))
   m$rank_total <- as.integer(rank(-ifelse(is.na(m$cnt_total), 0L, m$cnt_total), ties.method = "min"))
+  m$autocran_only <- if (is.null(autocran_map) || nrow(autocran_map) == 0) NA_integer_
+    else as.integer(autocran_map$autocran_only[match(m$package, autocran_map$package)])
   m <- m[order(m$rank_30d, m$package), , drop = FALSE]
   rownames(m) <- NULL
   m[SUMMARY_COLS]
@@ -225,7 +250,11 @@ write_release_notes <- function(path, manifest) {
     sprintf("| **Source this run** | %s |", manifest$source_kind %||% "n/a"),
     sprintf("| **Latest day** | %s |", manifest$summary$latest_date %||% "n/a"),
     sprintf("| **Packages tracked** | %s |", big(manifest$summary$packages)),
+    sprintf("| **autoCRAN-only (exact counts)** | %s of %s |",
+            big(manifest$summary$autocran_only), big(manifest$summary$packages)),
     sprintf("| **Changed this run** | %s |", changed),
+    "",
+    "> The remaining packages share an RPM name with the openSUSE distribution or another devel repo, so MirrorCache's count for them is not exclusive to autoCRAN. Filter `WHERE autocran_only = 1` (or sum only those rows) for autoCRAN-only totals.",
     "",
     "## Shard coverage",
     "",

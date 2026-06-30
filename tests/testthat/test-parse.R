@@ -49,3 +49,23 @@ test_that("parse_stat_response returns all-NA for empty data or junk", {
   expect_true(all(is.na(unlist(s))))
   expect_true(all(is.na(unlist(parse_stat_response("")))))
 })
+
+test_that("parse_location_paths extracts the repo paths", {
+  body <- '{"data":[
+    {"file":"R-x-1.rpm","name":"R-x","path":"/repositories/devel:/languages:/R:/autoCRAN/openSUSE_Tumbleweed/x86_64"},
+    {"file":"R-x-1.src.rpm","name":"R-x","path":"/repositories/devel:/languages:/R:/autoCRAN/openSUSE_Tumbleweed/src"}]}'
+  p <- parse_location_paths(body)
+  expect_length(p, 2L)
+  expect_true(all(grepl("autoCRAN", p)))
+  expect_length(parse_location_paths('{"data":[]}'), 0L)
+})
+
+test_that("classify_autocran_only flags only-autoCRAN names", {
+  expect_equal(classify_autocran_only(c(
+    "/repositories/devel:/languages:/R:/autoCRAN/openSUSE_Tumbleweed/x86_64",
+    "/repositories/devel:/languages:/R:/autoCRAN/openSUSE_Leap_16.0/x86_64")), 1L)
+  expect_equal(classify_autocran_only(c(
+    "/repositories/devel:/languages:/R:/autoCRAN/openSUSE_Tumbleweed/x86_64",
+    "/factory/repo/oss/x86_64")), 0L)            # also in the distribution
+  expect_true(is.na(classify_autocran_only(character(0))))
+})

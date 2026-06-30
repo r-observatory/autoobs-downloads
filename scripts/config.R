@@ -26,6 +26,11 @@ RECENT_WINDOW_DAYS <- 400L
 # volunteer-run openSUSE download infrastructure (~23k packages per daily run).
 FETCH_POOL <- 6L
 
+# How often to re-classify every package as autoCRAN-only vs also-shipped-elsewhere
+# (via package_locations). New names are classified every run; the full set is
+# refreshed at most this often, since repository membership changes slowly.
+CLASSIFY_REFRESH_DAYS <- 7L
+
 # Optional cap on the number of packages processed (0 = all). Used only for quick
 # local smoke tests; production leaves it unset.
 PACKAGE_LIMIT <- as.integer(Sys.getenv("AUTOOBS_LIMIT", "0"))

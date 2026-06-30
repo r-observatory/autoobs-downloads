@@ -42,9 +42,11 @@ embed_aux <- function(recent_path, summary_df, cache_df) {
   DBI::dbExecute(con, summary_table_ddl("autoobs_downloads_summary"))
   if (nrow(summary_df) > 0) DBI::dbWriteTable(con, "autoobs_downloads_summary", summary_df, append = TRUE)
   DBI::dbExecute(con, "DROP TABLE IF EXISTS autoobs_packages")
-  DBI::dbExecute(con, "CREATE TABLE autoobs_packages (package TEXT PRIMARY KEY, id INTEGER)")
+  DBI::dbExecute(con, "CREATE TABLE autoobs_packages
+    (package TEXT PRIMARY KEY, id INTEGER, autocran_only INTEGER)")
   if (nrow(cache_df) > 0)
-    DBI::dbWriteTable(con, "autoobs_packages", cache_df[c("package", "id")], append = TRUE)
+    DBI::dbWriteTable(con, "autoobs_packages",
+      cache_df[c("package", "id", "autocran_only")], append = TRUE)
 }
 
 run_update <- function(io, out_dir, force_full = FALSE) {
@@ -73,7 +75,8 @@ run_update <- function(io, out_dir, force_full = FALSE) {
   snap_str       <- format(snapshot_date, "%Y-%m-%d")
   attribute_date <- format(snapshot_date - 1L, "%Y-%m-%d")  # cnt_1d ~ the day just ended
 
-  cache      <- data.frame(package = character(0), id = integer(0), stringsAsFactors = FALSE)
+  cache      <- data.frame(package = character(0), id = integer(0),
+                           autocran_only = integer(0), stringsAsFactors = FALSE)
   daily_hist <- data.frame(package = character(0), date = character(0),
                            count = integer(0), stringsAsFactors = FALSE)
   load_daily <- function(path) {
@@ -86,8 +89,10 @@ run_update <- function(io, out_dir, force_full = FALSE) {
   }
   if (file.exists(recent_path)) {
     rc <- DBI::dbConnect(RSQLite::SQLite(), recent_path)
-    if ("autoobs_packages" %in% DBI::dbListTables(rc))
-      cache <- DBI::dbGetQuery(rc, "SELECT package, id FROM autoobs_packages")
+    if ("autoobs_packages" %in% DBI::dbListTables(rc)) {
+      cache <- DBI::dbGetQuery(rc, "SELECT * FROM autoobs_packages")
+      if (!"autocran_only" %in% names(cache)) cache$autocran_only <- NA_integer_
+    }
     DBI::dbDisconnect(rc)
     load_daily(recent_path)
   }
@@ -109,8 +114,10 @@ run_update <- function(io, out_dir, force_full = FALSE) {
   new_names <- setdiff(names, cache$package)
   if (length(new_names) > 0) {
     resolved <- tryCatch(io$resolve_ids(new_names), error = function(e) NULL)
-    if (!is.null(resolved) && nrow(resolved) > 0)
-      cache <- rbind(cache, resolved[c("package", "id")])
+    if (!is.null(resolved) && nrow(resolved) > 0) {
+      resolved$autocran_only <- NA_integer_
+      cache <- rbind(cache, resolved[c("package", "id", "autocran_only")])
+    }
   }
   cache <- cache[!duplicated(cache$package) & !is.na(cache$id), , drop = FALSE]
   if (nrow(cache) == 0) {
@@ -156,6 +163,33 @@ run_update <- function(io, out_dir, force_full = FALSE) {
   daily_all  <- rbind(daily_hist, daily_today)
   daily_all  <- daily_all[!duplicated(daily_all[c("package", "date")]), , drop = FALSE]
 
+  # Classify packages as autoCRAN-only vs also-shipped-elsewhere (via
+  # package_locations): always for newly-seen names, and for the whole set at most
+  # once per CLASSIFY_REFRESH_DAYS, since repository membership changes slowly.
+  last_classified <- prev$last_classified %||% NA_character_
+  refresh_due <- is.na(last_classified) || {
+    age <- tryCatch(as.numeric(difftime(now,
+      as.POSIXct(last_classified, tz = "UTC", format = "%Y-%m-%dT%H:%M:%SZ"),
+      units = "days")), error = function(e) Inf)
+    is.na(age) || age >= CLASSIFY_REFRESH_DAYS
+  }
+  to_classify     <- if (isTRUE(refresh_due)) cache$package else cache$package[is.na(cache$autocran_only)]
+  classified_full <- isTRUE(refresh_due) && length(to_classify) == 0L
+  if (length(to_classify) > 0) {
+    loc <- tryCatch(io$fetch_locations(to_classify), error = function(e) NULL)
+    if (!is.null(loc) && nrow(loc) > 0) {
+      idx  <- match(loc$package, cache$package)
+      keep <- !is.na(loc$autocran_only) & !is.na(idx)
+      if (any(keep)) {
+        cache$autocran_only[idx[keep]] <- loc$autocran_only[keep]
+        # Stamp the weekly clock only when at least one package was actually
+        # classified, so a refresh where every lookup failed is retried next run
+        # instead of being silently deferred for CLASSIFY_REFRESH_DAYS.
+        classified_full <- isTRUE(refresh_due)
+      }
+    }
+  }
+
   con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
   on.exit(DBI::dbDisconnect(con), add = TRUE)
   if (nrow(daily_all) > 0) {
@@ -163,7 +197,7 @@ run_update <- function(io, out_dir, force_full = FALSE) {
   } else {
     DBI::dbExecute(con, "CREATE TABLE autoobs_downloads_daily (package TEXT, date TEXT, count INTEGER)")
   }
-  summary_df <- build_summary(con, stats_df, attribute_date, snap_str)
+  summary_df <- build_summary(con, stats_df, attribute_date, snap_str, autocran_map = cache)
 
   years <- if (isTRUE(force_full) && nrow(daily_all) > 0)
     sort(unique(substr(daily_all$date, 1, 4))) else substr(attribute_date, 1, 4)
@@ -192,10 +226,12 @@ run_update <- function(io, out_dir, force_full = FALSE) {
     source_kind    = "mirrorcache",
     project        = OBS_PROJECT,
     granularities  = list("daily"),
+    last_classified = if (isTRUE(classified_full)) iso(now) else (prev$last_classified %||% NULL),
     changed_shards = as.list(changed_shards),
     shards         = merge_shard_coverage(prev_shards, shard_updates),
     summary        = list(
       packages         = nrow(summary_df),
+      autocran_only    = sum(summary_df$autocran_only == 1L, na.rm = TRUE),
       latest_date      = attribute_date,
       snapshot_date    = snap_str,
       daily_rows_today = nrow(daily_today)))
@@ -321,6 +357,15 @@ default_io <- function() {
         cnt_total  = vapply(parsed, function(p) p$cnt_total,  integer(1)),
         first_seen = vapply(parsed, function(p) p$first_seen, integer(1)),
         stringsAsFactors = FALSE)
+    },
+    fetch_locations = function(names) {
+      if (length(names) == 0) return(data.frame(package = character(0), autocran_only = integer(0)))
+      urls <- paste0(MIRRORCACHE_BASE, "/rest/search/package_locations?package=",
+                     vapply(names, curl::curl_escape, character(1)))
+      res  <- mc_multi(urls)
+      ao   <- vapply(res, function(x)
+        if (is.null(x)) NA_integer_ else classify_autocran_only(parse_location_paths(x)), integer(1))
+      data.frame(package = names, autocran_only = ao, stringsAsFactors = FALSE)
     },
     now = function() Sys.time())
 }

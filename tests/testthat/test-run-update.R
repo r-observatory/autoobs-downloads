@@ -8,7 +8,7 @@ publish <- function(out, pub) {
 # for the requested ids, in order. resolve_ids resolves names via idmap and records
 # how many names it was asked to resolve (to prove the id cache is reused).
 fake_io <- function(pub, names, idmap, stats_df, now, log = NULL,
-                    stats_ok = TRUE, list_ok = TRUE) {
+                    stats_ok = TRUE, list_ok = TRUE, only_pkgs = NULL, loc_fail = FALSE) {
   list(
     release_exists   = function() file.exists(file.path(pub, "manifest.json")),
     release_download = function(pattern, dir) {
@@ -23,6 +23,13 @@ fake_io <- function(pub, names, idmap, stats_df, now, log = NULL,
     fetch_stats = function(ids) {
       if (!stats_ok) return(NULL)
       stats_df[match(ids, stats_df$id), , drop = FALSE]
+    },
+    fetch_locations = function(nm) {
+      if (!is.null(log)) log$located <- c(log$located, length(nm))
+      ao <- if (loc_fail) rep(NA_integer_, length(nm))
+            else if (is.null(only_pkgs)) rep(1L, length(nm))
+            else as.integer(nm %in% only_pkgs)
+      data.frame(package = nm, autocran_only = ao, stringsAsFactors = FALSE)
     },
     now = function() now)
 }
@@ -88,6 +95,72 @@ test_that("run_update falls back to the cached package set when enumeration fail
   con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out2, "autoobs-downloads-recent.db"))
   on.exit(DBI::dbDisconnect(con))
   expect_equal(DBI::dbGetQuery(con, "SELECT COUNT(*) n FROM autoobs_downloads_daily")$n, 2L)
+})
+
+test_that("run_update classifies autocran_only and refreshes new names only within the window", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  names <- c("R-Rcpp", "R-AER"); idmap <- c("R-Rcpp" = 100L, "R-AER" = 200L)
+  s1 <- day_stats(stats_row(100, 10, 70, 300, 1000), stats_row(200, 5, 40, 200, 500))
+  log1 <- new.env()
+  # R-Rcpp is shared (also elsewhere), R-AER is autoCRAN-only.
+  out1 <- file.path(tmp, "out1")
+  run_update(fake_io(pub, names, idmap, s1, as.POSIXct("2026-06-11 04:00:00", tz = "UTC"),
+                     log = log1, only_pkgs = "R-AER"), out1)
+  expect_equal(log1$located, 2L)              # cold run classifies every name
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out1, "autoobs-downloads-recent.db"))
+  s <- DBI::dbGetQuery(con, "SELECT package, autocran_only FROM autoobs_downloads_summary ORDER BY package")
+  expect_equal(s$autocran_only[s$package == "R-AER"], 1L)
+  expect_equal(s$autocran_only[s$package == "R-Rcpp"], 0L)
+  pk <- DBI::dbGetQuery(con, "SELECT package, autocran_only FROM autoobs_packages ORDER BY package")
+  expect_equal(nrow(pk), 2L)
+  DBI::dbDisconnect(con)
+  man <- jsonlite::fromJSON(file.path(out1, "manifest.json"), simplifyVector = FALSE)
+  expect_false(is.null(man$last_classified))
+  expect_equal(man$summary$autocran_only, 1L)
+  publish(out1, pub)
+
+  # Day 2 within the refresh window: no new names -> no classification calls.
+  log2 <- new.env()
+  out2 <- file.path(tmp, "out2")
+  run_update(fake_io(pub, names, idmap,
+                     day_stats(stats_row(100, 11, 71, 301, 1001), stats_row(200, 6, 41, 201, 501)),
+                     as.POSIXct("2026-06-12 04:00:00", tz = "UTC"), log = log2, only_pkgs = "R-AER"), out2)
+  expect_null(log2$located)                   # cache still fresh -> package_locations not hit
+  con2 <- DBI::dbConnect(RSQLite::SQLite(), file.path(out2, "autoobs-downloads-recent.db"))
+  on.exit(DBI::dbDisconnect(con2))
+  s2 <- DBI::dbGetQuery(con2, "SELECT package, autocran_only FROM autoobs_downloads_summary")
+  expect_equal(s2$autocran_only[s2$package == "R-AER"], 1L)   # carried in the cache
+})
+
+test_that("a refresh where every location lookup fails does not stamp the weekly clock", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  names <- "R-AER"; idmap <- c("R-AER" = 200L)
+  s <- stats_row(200, 5, 40, 200, 500)
+  run_update(fake_io(pub, names, idmap, s, as.POSIXct("2026-06-11 04:00:00", tz = "UTC"),
+                     loc_fail = TRUE), file.path(tmp, "out1"))
+  man <- jsonlite::fromJSON(file.path(tmp, "out1", "manifest.json"), simplifyVector = FALSE)
+  expect_null(man$last_classified)            # nothing classified -> clock not stamped
+
+  # Next run still treats it as due and classifies for real.
+  publish(file.path(tmp, "out1"), pub)
+  log2 <- new.env()
+  run_update(fake_io(pub, names, idmap, s, as.POSIXct("2026-06-12 04:00:00", tz = "UTC"),
+                     log = log2), file.path(tmp, "out2"))
+  expect_equal(log2$located, 1L)              # retried because the prior refresh did not stamp
+})
+
+test_that("run_update re-runs a full classification after the refresh window", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  names <- "R-AER"; idmap <- c("R-AER" = 200L)
+  run_update(fake_io(pub, names, idmap, stats_row(200, 5, 40, 200, 500),
+                     as.POSIXct("2026-06-11 04:00:00", tz = "UTC")), file.path(tmp, "out1"))
+  publish(file.path(tmp, "out1"), pub)
+
+  log2 <- new.env()
+  run_update(fake_io(pub, names, idmap, stats_row(200, 6, 41, 201, 501),
+                     as.POSIXct("2026-06-20 04:00:00", tz = "UTC"), log = log2), file.path(tmp, "out2"))
+  expect_equal(log2$located, 1L)              # >7 days later -> full re-classify
 })
 
 test_that("run_update drops all-NA stat rows so a failed fetch never publishes NULL windows", {
