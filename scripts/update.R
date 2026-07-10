@@ -43,10 +43,12 @@ embed_aux <- function(recent_path, summary_df, cache_df) {
   if (nrow(summary_df) > 0) DBI::dbWriteTable(con, "autoobs_downloads_summary", summary_df, append = TRUE)
   DBI::dbExecute(con, "DROP TABLE IF EXISTS autoobs_packages")
   DBI::dbExecute(con, "CREATE TABLE autoobs_packages
-    (package TEXT PRIMARY KEY, id INTEGER, autocran_only INTEGER)")
+    (package TEXT PRIMARY KEY, id INTEGER, autocran_only INTEGER,
+     origin TEXT, canonical_name TEXT, identity_state TEXT)")
   if (nrow(cache_df) > 0)
     DBI::dbWriteTable(con, "autoobs_packages",
-      cache_df[c("package", "id", "autocran_only")], append = TRUE)
+      cache_df[c("package", "id", "autocran_only",
+                 "origin", "canonical_name", "identity_state")], append = TRUE)
 }
 
 # Download the identity assets, load the name maps, and size-gate them; returns
@@ -61,7 +63,8 @@ resolve_gated_identity <- function(io, names, cran_floor, bioc_floor) {
   resolve_identities(names, maps)
 }
 
-run_update <- function(io, out_dir, force_full = FALSE) {
+run_update <- function(io, out_dir, force_full = FALSE,
+                       cran_floor = CRAN_NAMES_FLOOR, bioc_floor = BIOC_NAMES_FLOOR) {
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
   manifest_path <- file.path(out_dir, "manifest.json")
   recent_path   <- file.path(out_dir, "autoobs-downloads-recent.db")
@@ -88,7 +91,9 @@ run_update <- function(io, out_dir, force_full = FALSE) {
   attribute_date <- format(snapshot_date - 1L, "%Y-%m-%d")  # cnt_1d ~ the day just ended
 
   cache      <- data.frame(package = character(0), id = integer(0),
-                           autocran_only = integer(0), stringsAsFactors = FALSE)
+                           autocran_only = integer(0), origin = character(0),
+                           canonical_name = character(0), identity_state = character(0),
+                           stringsAsFactors = FALSE)
   daily_hist <- data.frame(package = character(0), date = character(0),
                            count = integer(0), stringsAsFactors = FALSE)
   load_daily <- function(path) {
@@ -103,7 +108,10 @@ run_update <- function(io, out_dir, force_full = FALSE) {
     rc <- DBI::dbConnect(RSQLite::SQLite(), recent_path)
     if ("autoobs_packages" %in% DBI::dbListTables(rc)) {
       cache <- DBI::dbGetQuery(rc, "SELECT * FROM autoobs_packages")
-      if (!"autocran_only" %in% names(cache)) cache$autocran_only <- NA_integer_
+      if (!"autocran_only"  %in% names(cache)) cache$autocran_only  <- rep(NA_integer_,   nrow(cache))
+      if (!"origin"         %in% names(cache)) cache$origin         <- rep(NA_character_, nrow(cache))
+      if (!"canonical_name" %in% names(cache)) cache$canonical_name <- rep(NA_character_, nrow(cache))
+      if (!"identity_state" %in% names(cache)) cache$identity_state <- rep(NA_character_, nrow(cache))
     }
     DBI::dbDisconnect(rc)
     load_daily(recent_path)
@@ -127,8 +135,12 @@ run_update <- function(io, out_dir, force_full = FALSE) {
   if (length(new_names) > 0) {
     resolved <- tryCatch(io$resolve_ids(new_names), error = function(e) NULL)
     if (!is.null(resolved) && nrow(resolved) > 0) {
-      resolved$autocran_only <- NA_integer_
-      cache <- rbind(cache, resolved[c("package", "id", "autocran_only")])
+      resolved$autocran_only  <- NA_integer_
+      resolved$origin         <- NA_character_
+      resolved$canonical_name <- NA_character_
+      resolved$identity_state <- NA_character_
+      cache <- rbind(cache, resolved[c("package", "id", "autocran_only",
+                                       "origin", "canonical_name", "identity_state")])
     }
   }
   cache <- cache[!duplicated(cache$package) & !is.na(cache$id), , drop = FALSE]
@@ -202,6 +214,35 @@ run_update <- function(io, out_dir, force_full = FALSE) {
     }
   }
 
+  # Resolve every tracked package against the shared identity ledger, size-gated.
+  # On a ledger fetch error or a failed gate, degrade to the origins persisted in
+  # the package cache (loaded from the prior recent shard); genuinely new names the
+  # cache does not yet carry stay origin='other', identity_state NA (honest unknown,
+  # never a fabricated state). A cold run (no prior release, so no cache substrate)
+  # aborts rather than publish an unclassified summary.
+  identity_df <- tryCatch(
+    resolve_gated_identity(io, cache$package, cran_floor, bioc_floor),
+    error = function(e) {
+      if (length(prev) == 0)
+        stop("identity ledger unavailable on a cold run (no cached origins to fall ",
+             "back on); aborting rather than publish an unclassified summary: ",
+             conditionMessage(e))
+      message("identity unavailable (", conditionMessage(e),
+              "); falling back to the cached package origins")
+      data.frame(package        = cache$package,
+                 origin         = ifelse(is.na(cache$origin), "other", cache$origin),
+                 canonical_name = cache$canonical_name,
+                 identity_state = cache$identity_state,
+                 stringsAsFactors = FALSE)
+    })
+  # Persist the fresh classification back into the cache so embed_aux writes it and
+  # the next run has a degrade substrate. autocran_only is orthogonal (count-
+  # exclusivity, not origin) and is left untouched.
+  midx <- match(cache$package, identity_df$package)
+  cache$origin         <- identity_df$origin[midx]
+  cache$canonical_name <- identity_df$canonical_name[midx]
+  cache$identity_state <- identity_df$identity_state[midx]
+
   con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
   on.exit(DBI::dbDisconnect(con), add = TRUE)
   if (nrow(daily_all) > 0) {
@@ -209,7 +250,8 @@ run_update <- function(io, out_dir, force_full = FALSE) {
   } else {
     DBI::dbExecute(con, "CREATE TABLE autoobs_downloads_daily (package TEXT, date TEXT, count INTEGER)")
   }
-  summary_df <- build_summary(con, stats_df, attribute_date, snap_str, autocran_map = cache)
+  summary_df <- build_summary(con, stats_df, attribute_date, snap_str,
+                              identity_df = identity_df, autocran_map = cache)
 
   years <- if (isTRUE(force_full) && nrow(daily_all) > 0)
     sort(unique(substr(daily_all$date, 1, 4))) else substr(attribute_date, 1, 4)
@@ -243,6 +285,9 @@ run_update <- function(io, out_dir, force_full = FALSE) {
     shards         = merge_shard_coverage(prev_shards, shard_updates),
     summary        = list(
       packages         = nrow(summary_df),
+      in_scope         = nrow(summary_df),
+      out_of_scope     = nrow(stats_df) - nrow(summary_df),
+      raw_tracked      = nrow(stats_df),
       autocran_only    = sum(summary_df$autocran_only == 1L, na.rm = TRUE),
       latest_date      = attribute_date,
       snapshot_date    = snap_str,
