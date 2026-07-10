@@ -356,3 +356,34 @@ test_that("run_update aborts on a cold run when the identity size gate fails", {
                file.path(tmp, "out1"), cran_floor = 999999L, bioc_floor = 0L),
     "cold run")
 })
+
+test_that("raw counts survive in the shards while ranks stay dense over in-scope packages", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  names <- c("R-Rcpp", "R-AER", "R-base", "R-notacran")
+  idmap <- c("R-Rcpp" = 100L, "R-AER" = 200L, "R-base" = 300L, "R-notacran" = 400L)
+  s1 <- day_stats(
+    stats_row(100, cnt_1d = 30, 200, 900, 9000),   # in-scope, biggest
+    stats_row(200, cnt_1d = 10,  70, 300, 3000),   # in-scope
+    stats_row(300, cnt_1d = 99, 700, 999, 9999),   # R-base runtime, out of scope
+    stats_row(400, cnt_1d =  5,  40, 120, 1200))   # unknown token, out of scope
+  out1 <- file.path(tmp, "out1")
+  # cran fixture knows only Rcpp and AER -> R-base and R-notacran fall to 'other'.
+  run_update(fake_io(pub, names, idmap, s1, as.POSIXct("2026-06-11 04:00:00", tz = "UTC"),
+                     cran = c("Rcpp", "AER")), out1, cran_floor = 1L, bioc_floor = 0L)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out1, "autoobs-downloads-recent.db"))
+  on.exit(DBI::dbDisconnect(con))
+  s <- DBI::dbGetQuery(con,
+    "SELECT package, rank_30d FROM autoobs_downloads_summary ORDER BY rank_30d")
+  expect_equal(s$package, c("R-Rcpp", "R-AER"))      # only in-scope, dense ranks
+  expect_equal(s$rank_30d, c(1L, 2L))                # no gaps from the dropped rows
+
+  con2 <- DBI::dbConnect(RSQLite::SQLite(), file.path(out1, "autoobs-downloads-2026.db"))
+  on.exit(DBI::dbDisconnect(con2), add = TRUE)
+  raw <- DBI::dbGetQuery(con2,
+    "SELECT package, count FROM autoobs_downloads_daily ORDER BY package")
+  expect_true(all(c("R-base", "R-notacran") %in% raw$package))   # out-of-scope raw retained
+  man <- jsonlite::fromJSON(file.path(out1, "manifest.json"), simplifyVector = FALSE)
+  expect_equal(man$summary$in_scope + man$summary$out_of_scope, man$summary$raw_tracked)
+  expect_equal(man$summary$out_of_scope, 2L)
+})
