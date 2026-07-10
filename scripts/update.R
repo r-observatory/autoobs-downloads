@@ -49,6 +49,18 @@ embed_aux <- function(recent_path, summary_df, cache_df) {
       cache_df[c("package", "id", "autocran_only")], append = TRUE)
 }
 
+# Download the identity assets, load the name maps, and size-gate them; returns
+# the in-scope identity frame for `names`. Errors (unreachable asset or a failed
+# gate) propagate so run_update decides whether to degrade or abort.
+resolve_gated_identity <- function(io, names, cran_floor, bioc_floor) {
+  dbs  <- io$identity_dbs()
+  maps <- robservatory::load_identity(dbs$cran, dbs$bioc)
+  if (!robservatory::check_size(maps$n_cran, floor = cran_floor) ||
+      !robservatory::check_size(maps$n_bioc, floor = bioc_floor))
+    stop("identity size gate failed (cran=", maps$n_cran, ", bioc=", maps$n_bioc, ")")
+  resolve_identities(names, maps)
+}
+
 run_update <- function(io, out_dir, force_full = FALSE) {
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
   manifest_path <- file.path(out_dir, "manifest.json")
@@ -366,6 +378,20 @@ default_io <- function() {
       ao   <- vapply(res, function(x)
         if (is.null(x)) NA_integer_ else classify_autocran_only(parse_location_paths(x)), integer(1))
       data.frame(package = names, autocran_only = ao, stringsAsFactors = FALSE)
+    },
+    identity_dbs = function() {
+      tmp <- tempfile(); dir.create(tmp, showWarnings = FALSE)
+      dl <- function(repo, db) {
+        st <- suppressWarnings(system2("gh",
+          c("release", "download", "current", "--repo", repo,
+            "--pattern", db, "--dir", tmp, "--clobber"), stdout = FALSE, stderr = FALSE))
+        p <- file.path(tmp, db)
+        if (!identical(as.integer(st), 0L) || !file.exists(p))
+          stop("identity asset unreachable: ", repo, "/", db)
+        p
+      }
+      list(cran = dl(CRAN_ARCHIVE_REPO, CRAN_ARCHIVE_DB),
+           bioc = dl(BIOC_META_REPO, BIOC_META_DB))
     },
     now = function() Sys.time())
 }

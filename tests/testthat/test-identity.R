@@ -39,3 +39,36 @@ test_that("resolve_identities passes prefix_hint = NULL so Bioc R-* builds do no
   maps <- .mk_maps()
   expect_no_warning(resolve_identities("R-ComplexHeatmap", maps))
 })
+
+.fixture_io <- function(cran = character(0), bioc = character(0), fail_identity = FALSE) {
+  d <- tempfile("identity-dbs-"); dir.create(d)
+  withr::defer(unlink(d, recursive = TRUE), envir = parent.frame())
+  cran_db <- file.path(d, "cran-archive.db"); bioc_db <- file.path(d, "bioc-meta.db")
+  .write_names_db(cran_db, "cran_names_all", cran)
+  .write_names_db(bioc_db, "bioc_names_all", bioc)
+  list(identity_dbs = function() {
+    if (isTRUE(fail_identity)) stop("identity assets unreachable")
+    list(cran = cran_db, bioc = bioc_db)
+  })
+}
+
+test_that("resolve_gated_identity classifies through the size gate", {
+  io  <- .fixture_io(cran = c("Rcpp", "AER"))
+  out <- resolve_gated_identity(io, c("R-Rcpp", "R-notacran"),
+                                 cran_floor = 1L, bioc_floor = 0L)
+  expect_equal(out$origin[out$package == "R-Rcpp"], "cran")
+  expect_equal(out$origin[out$package == "R-notacran"], "other")
+})
+
+test_that("resolve_gated_identity errors when the size gate fails", {
+  io <- .fixture_io(cran = c("Rcpp", "AER"))
+  expect_error(
+    resolve_gated_identity(io, "R-Rcpp", cran_floor = 999999L, bioc_floor = 0L),
+    "size gate failed")
+})
+
+test_that("resolve_gated_identity propagates an unreachable-asset error", {
+  io <- .fixture_io(cran = c("Rcpp"), fail_identity = TRUE)
+  expect_error(resolve_gated_identity(io, "R-Rcpp", cran_floor = 1L, bioc_floor = 0L),
+               "unreachable")
+})
