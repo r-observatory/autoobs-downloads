@@ -2,6 +2,34 @@
 
 `%||%` <- function(a, b) if (is.null(a)) b else a
 
+# Classify autoCRAN RPM names against the shared identity maps. Each binary is
+# named "R-<cran-name>" (CRAN casing preserved), so strip a leading "R-" and
+# resolve the remainder via robservatory::resolve_identity. The R- prefix asserts
+# "is an R package," not CRAN-vs-Bioc, so prefix_hint is NULL (a "cran" hint would
+# warn spuriously on legitimately-Bioc R-* builds). A name without a leading "R-",
+# or one the resolver does not know, is origin='other' (honest unknown), so the
+# promote-only filter in build_summary drops it.
+resolve_identities <- function(names, maps) {
+  n <- length(names)
+  origin    <- rep("other", n)
+  canonical <- rep(NA_character_, n)
+  state     <- rep(NA_character_, n)
+  for (i in seq_len(n)) {
+    p <- names[i]
+    if (!startsWith(p, "R-")) next  # not an R-<name> binary: leave as other
+    stripped <- substring(p, nchar("R-") + 1L)
+    r <- robservatory::resolve_identity(stripped, maps, prefix_hint = NULL)
+    if (isTRUE(r$in_scope)) {
+      origin[i]    <- r$origin
+      canonical[i] <- r$canonical_name
+      state[i]     <- r$identity_state
+    }
+  }
+  data.frame(package = names, origin = origin,
+             canonical_name = canonical, identity_state = state,
+             stringsAsFactors = FALSE)
+}
+
 # Extract the primary.xml location href from an rpm-md repomd.xml document.
 parse_repomd_primary_href <- function(xml_text) {
   doc <- xml2::read_xml(xml_text)
