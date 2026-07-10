@@ -34,3 +34,14 @@ CLASSIFY_REFRESH_DAYS <- 7L
 # Optional cap on the number of packages processed (0 = all). Used only for quick
 # local smoke tests; production leaves it unset.
 PACKAGE_LIMIT <- as.integer(Sys.getenv("AUTOOBS_LIMIT", "0"))
+
+# Identity is resolved by the robservatory package against two downloaded assets:
+# cran-archive.db's cran_names_all and bioconductor-metadata's bioc_names_all. An
+# autoCRAN binary is "R-<cran-name>"; the leading "R-" is stripped and the
+# remainder resolved, so a package's origin comes SOLELY from the ledger.
+CRAN_ARCHIVE_REPO <- "r-observatory/cran-archive"
+CRAN_ARCHIVE_DB   <- "cran-archive.db"
+BIOC_META_REPO    <- "r-observatory/bioconductor-metadata"
+BIOC_META_DB      <- "bioconductor-metadata.db"
+CRAN_NAMES_FLOOR  <- 15000L   # below this the identity fetch is treated as partial
+BIOC_NAMES_FLOOR  <- 1500L

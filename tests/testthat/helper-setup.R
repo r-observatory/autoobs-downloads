@@ -28,3 +28,21 @@ na_stats_row <- function(id) {
              cnt_7d = NA_integer_, cnt_30d = NA_integer_, cnt_total = NA_integer_,
              first_seen = NA_integer_, stringsAsFactors = FALSE)
 }
+
+# Write a cran_names_all/bioc_names_all fixture DB at `path` (schema matching the
+# real identity assets), populated from `names` (a character vector of canonical
+# package names). Always creates the table, even for an empty vector, since
+# robservatory::load_identity requires both tables to exist.
+.write_names_db <- function(path, table, names) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con))
+  DBI::dbExecute(con, sprintf(
+    "CREATE TABLE %s (name_lower TEXT PRIMARY KEY, canonical_name TEXT,
+       identity_state TEXT, first_seen TEXT, last_seen TEXT)", table))
+  if (length(names) > 0L) {
+    DBI::dbWriteTable(con, table, data.frame(
+      name_lower = tolower(names), canonical_name = names,
+      identity_state = "live", first_seen = "x", last_seen = "y",
+      stringsAsFactors = FALSE), append = TRUE)
+  }
+}
