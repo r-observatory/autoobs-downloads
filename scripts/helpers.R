@@ -157,30 +157,35 @@ export_summary_shard <- function(path, summary) {
 # embedded into the recent shard.
 summary_table_ddl <- function(table) {
   sprintf("CREATE TABLE %s (
-      package       TEXT,
-      package_lower TEXT,
-      id            INTEGER,
-      total_1d      INTEGER,
-      total_7d      INTEGER,
-      total_30d     INTEGER,
-      cnt_total     INTEGER,
-      avg_daily_30d REAL,
-      rank_30d      INTEGER,
-      rank_total    INTEGER,
-      trend         REAL,
-      autocran_only INTEGER,
-      first_seen    TEXT,
-      last_snapshot TEXT,
+      package        TEXT,
+      package_lower  TEXT,
+      origin         TEXT,
+      canonical_name TEXT,
+      identity_state TEXT,
+      id             INTEGER,
+      total_1d       INTEGER,
+      total_7d       INTEGER,
+      total_30d      INTEGER,
+      cnt_total      INTEGER,
+      avg_daily_30d  REAL,
+      rank_30d       INTEGER,
+      rank_total     INTEGER,
+      trend          REAL,
+      autocran_only  INTEGER,
+      first_seen     TEXT,
+      last_snapshot  TEXT,
       PRIMARY KEY (package))", table)
 }
 
-SUMMARY_COLS <- c("package", "package_lower", "id", "total_1d", "total_7d", "total_30d",
+SUMMARY_COLS <- c("package", "package_lower", "origin", "canonical_name", "identity_state",
+                  "id", "total_1d", "total_7d", "total_30d",
                   "cnt_total", "avg_daily_30d", "rank_30d", "rank_total", "trend",
                   "autocran_only", "first_seen", "last_snapshot")
 
 empty_summary <- function() {
   as.data.frame(setNames(lapply(SUMMARY_COLS, function(x) switch(x,
-    package = , package_lower = , first_seen = , last_snapshot = character(0),
+    package = , package_lower = , origin = , canonical_name = , identity_state = ,
+    first_seen = , last_snapshot = character(0),
     avg_daily_30d = , trend = numeric(0), integer(0))), SUMMARY_COLS),
     stringsAsFactors = FALSE)
 }
@@ -189,10 +194,12 @@ empty_summary <- function() {
 # come straight from MirrorCache's own counters in `stats_df` (so the summary is
 # meaningful from the first run, before this pipeline has accumulated its own
 # series). `trend` compares the last 30 days of the locally-accumulated daily
-# series to the prior 30, so it is NULL until ~60 days of history exist. Ranks are
-# global (this project ships a single category of packages).
+# series to the prior 30, so it is NULL until ~60 days of history exist. The
+# summary is promote-only: origin='other' rows (not a known CRAN/Bioc package) are
+# dropped before ranking, so rank_30d/rank_total are dense over the in-scope
+# survivors only.
 build_summary <- function(daily_con, stats_df, anchor_date, snapshot_date,
-                          autocran_map = NULL) {
+                          identity_df = NULL, autocran_map = NULL) {
   if (nrow(stats_df) == 0) return(empty_summary())
   base <- data.frame(
     package       = stats_df$package,
@@ -207,6 +214,21 @@ build_summary <- function(daily_con, stats_df, anchor_date, snapshot_date,
     last_snapshot = snapshot_date,
     stringsAsFactors = FALSE)
 
+  # Attach origin/canonical_name/identity_state from the ledger classification,
+  # keyed by the full R-<name>. An absent identity frame or an unmatched row is an
+  # honest unknown -> origin='other', which the promote-only filter below drops.
+  if (is.null(identity_df) || nrow(identity_df) == 0) {
+    base$origin         <- rep("other", nrow(base))
+    base$canonical_name <- rep(NA_character_, nrow(base))
+    base$identity_state <- rep(NA_character_, nrow(base))
+  } else {
+    idx <- match(base$package, identity_df$package)
+    base$origin         <- identity_df$origin[idx]
+    base$canonical_name <- identity_df$canonical_name[idx]
+    base$identity_state <- identity_df$identity_state[idx]
+    base$origin         <- ifelse(is.na(base$origin), "other", base$origin)
+  }
+
   a  <- format(as.Date(anchor_date), "%Y-%m-%d")
   tr <- DBI::dbGetQuery(daily_con, sprintf("
     SELECT package,
@@ -218,6 +240,13 @@ build_summary <- function(daily_con, stats_df, anchor_date, snapshot_date,
   m <- merge(base, tr, by = "package", all.x = TRUE)
   m$trend <- ifelse(!is.na(m$prev30) & m$prev30 > 0,
                     round((m$last30 / m$prev30 - 1) * 100, 2), NA_real_)
+
+  # Promote only in-scope packages: drop origin='other' (the R-base runtime,
+  # -devel/-debuginfo subpackages, distro-shared RPMs, and any R-* the ledger does
+  # not know) BEFORE ranking, so ranks are dense over the in-scope survivors.
+  m <- m[m$origin %in% c("cran", "bioc"), , drop = FALSE]
+  if (nrow(m) == 0) return(empty_summary())
+
   m$rank_30d   <- as.integer(rank(-ifelse(is.na(m$total_30d), 0L, m$total_30d), ties.method = "min"))
   m$rank_total <- as.integer(rank(-ifelse(is.na(m$cnt_total), 0L, m$cnt_total), ties.method = "min"))
   m$autocran_only <- if (is.null(autocran_map) || nrow(autocran_map) == 0) NA_integer_
