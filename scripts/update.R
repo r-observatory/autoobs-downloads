@@ -268,7 +268,8 @@ run_update <- function(io, out_dir, force_full = FALSE,
   r_rows  <- daily_all[daily_all$date >= win_cut, , drop = FALSE]
   export_shard(recent_path, r_rows)
   embed_aux(recent_path, summary_df, cache)
-  export_summary_shard(file.path(out_dir, "autoobs-downloads-summary.db"), summary_df)
+  summary_out <- file.path(out_dir, "autoobs-downloads-summary.db")
+  export_summary_shard(summary_out, summary_df)
   changed_shards <- c(changed_shards, "autoobs-downloads-recent.db", "autoobs-downloads-summary.db")
   shard_updates[["autoobs-downloads-recent.db"]] <- coverage(r_rows)
 
@@ -292,7 +293,15 @@ run_update <- function(io, out_dir, force_full = FALSE,
       latest_date      = attribute_date,
       snapshot_date    = snap_str,
       daily_rows_today = nrow(daily_today)))
-  write_manifest(manifest_path, out)
+
+  # Integrity / completeness core for the summary DB the downstream merge pulls.
+  # Computed from the finalized on-disk autoobs-downloads-summary.db (exported
+  # above) so db_bytes/db_sha256 describe the exact uploaded bytes. The summary is
+  # a full rebuild every run: its rolling windows (total_1d/7d/30d, cnt_total) are
+  # MirrorCache's own counters and its trend sits inside the always-loaded 400-day
+  # recent window, so it is a complete snapshot -> complete = TRUE.
+  integrity_core <- summary_integrity_core(summary_out, complete = TRUE)
+  write_manifest(manifest_path, out, core = integrity_core)
   write_release_notes(file.path(out_dir, "release_notes.md"), out)
   list(changed_shards = changed_shards, manifest = out)
 }
