@@ -296,10 +296,15 @@ run_update <- function(io, out_dir, force_full = FALSE,
 
   # Integrity / completeness core for the summary DB the downstream merge pulls.
   # Computed from the finalized on-disk autoobs-downloads-summary.db (exported
-  # above) so db_bytes/db_sha256 describe the exact uploaded bytes. The summary is
-  # a full rebuild every run: its rolling windows (total_1d/7d/30d, cnt_total) are
-  # MirrorCache's own counters and its trend sits inside the always-loaded 400-day
-  # recent window, so it is a complete snapshot -> complete = TRUE.
+  # above) so db_bytes/db_sha256 describe the exact uploaded bytes.
+  #
+  # complete = TRUE: the DB holds the full, non-partial dataset (a full rebuild
+  # each run, not an incremental/partial one). Its rolling windows
+  # (total_1d/7d/30d, cnt_total) are MirrorCache's own counters and its trend
+  # sits inside the always-loaded 400-day recent window, so every run is a
+  # complete snapshot. Freshness is tracked separately via generated_at and the
+  # db_sha256 content fingerprint. A pipeline with a genuine partial/bootstrap
+  # state would derive this flag instead of hardcoding it.
   integrity_core <- summary_integrity_core(summary_out, complete = TRUE)
   write_manifest(manifest_path, out, core = integrity_core)
   write_release_notes(file.path(out_dir, "release_notes.md"), out)
