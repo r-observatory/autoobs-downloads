@@ -70,3 +70,20 @@ fill_truth <- function(from = "2026-05-01", to = "2026-06-10") {
   t$count[t$package == "R-b" & t$date == "2026-06-05"] <- 0L
   t
 }
+
+# The truth series plus R-x, a package outside the summary's scope.
+with_outsider <- function(truth) {
+  d <- sort(unique(truth$date))
+  rbind(truth, data.frame(package = "R-x", date = d, count = 2L + seq_along(d) %% 4L))
+}
+
+# One run and its counters as a refill reads them. `source` is "run" for a
+# pipeline run; `last` is the last day MirrorCache had counted when it was late.
+snapshot_fixture <- function(truth, ids, S, source = "observatory.db x", last = NULL, hour = 0L) {
+  cn <- mc_counters(truth, ids, S, last = last)
+  cs <- counter_stats(cn)
+  rid <- as.integer(as.numeric(as.POSIXct(S, tz = "UTC"))) + as.integer(hour) * 3600L
+  list(run = run_row(c(list(run_id = rid, snapshot_date = S, source = source, outcome = "ok",
+                            window_end = window_end_for(S, cs$day_aggregated)), cs)),
+       cn = cbind(cn[setdiff(names(cn), c("id", "first_seen"))], run_id = rid))
+}

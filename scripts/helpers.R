@@ -390,6 +390,16 @@ COUNTERS_DDL <- "CREATE TABLE IF NOT EXISTS autoobs_counters (
   cnt_total INTEGER,
   PRIMARY KEY (run_id, package)) WITHOUT ROWID"
 
+empty_counters <- function() data.frame(run_id = integer(0), package = character(0),
+  cnt_today = integer(0), cnt_1d = integer(0), cnt_7d = integer(0), cnt_30d = integer(0),
+  cnt_total = integer(0), stringsAsFactors = FALSE)
+
+read_counters <- function(path) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  DBI::dbReadTable(con, "autoobs_counters")[names(empty_counters())]
+}
+
 counters_rows <- function(stats_df, run_id) {
   s <- stats_df[!duplicated(stats_df$package), , drop = FALSE]
   data.frame(run_id = rep(as.integer(run_id), nrow(s)), package = s$package,
@@ -668,36 +678,49 @@ run_equations <- function(counters, snapshot_date, window_end, method = "window"
 }
 
 # Solve, one day at a time, every equation with exactly one unknown date and no
-# date before `floor`. A negative package refuses the day; a day summing to 0 is
-# 'upstream_missing' with no rows, unless it is the equation's own `soft` day,
-# which stays unknown. Fully known equations that do not add up are counted per
-# package in `residual`.
-solve_days <- function(eqs, daily, known, floor, run_id) {
+# date before `floor`. A negative package refuses the day; a zero day is
+# 'upstream_missing', or stays unknown when it is the equation's own `soft` day.
+# `since` maps known days to the run that first held them, `partial` days lack
+# the `uncovered` packages, and `strict` also needs every other fully known
+# equation over the day to agree. `residual` counts packages that do not add up.
+solve_days <- function(eqs, daily, known, floor, run_id, strict = FALSE, since = NULL,
+                       partial = character(0), uncovered = character(0)) {
   rows <- data.frame(package = character(0), date = character(0), count = integer(0),
                      stringsAsFactors = FALSE)
   days <- empty_days(); refused <- character(0)
+  if (is.null(since)) since <- stats::setNames(rep(0L, length(known)), known)
   repeat {
     progress <- FALSE
     for (e in eqs) {
       d <- names(e$coef)
-      if (any(d < floor) || nrow(e$value) == 0) next
+      if (any(d < floor)) next
       unk <- setdiff(d, known)
       if (length(unk) != 1L || unk %in% refused) next
       u <- unk
+      if (!.confirmed(e, since, u)) next
+      e <- .covered(e, partial, uncovered)
+      if (nrow(e$value) == 0) next
       ks <- .signed_sums(rbind(daily, rows), e$coef, setdiff(d, u), e$value$package)
       cu <- (e$value$value - ks[e$value$package]) / e$coef[[u]]
       if (any(cu < 0)) { refused <- c(refused, u); next }
       # Zero on the run's unsure last day may only mean MirrorCache was late.
       if (u %in% names(e$soft) && sum(cu) == 0) next
       pos <- cu > 0
-      if (any(pos))
-        rows <- rbind(rows, data.frame(package = e$value$package[pos], date = u,
-                                       count = as.integer(cu[pos]), stringsAsFactors = FALSE))
-      days <- rbind(days, data.frame(date = u,
-        method = if (any(pos)) e$method else "upstream_missing",
+      add <- data.frame(package = e$value$package[pos], date = rep(u, sum(pos)),
+                        count = as.integer(cu[pos]), stringsAsFactors = FALSE)
+      method <- if (any(pos)) e$method else "upstream_missing"
+      # A positive unsure day was inside that run's windows; any other day is new.
+      held <- stats::setNames(if (u %in% names(e$soft)) e$soft[[u]] else .Machine$integer.max, u)
+      part <- if (method == "release") c(partial, u) else partial
+      if (strict && !.agrees(eqs, rbind(daily, rows, add), c(known, u), u, floor,
+                             c(since, held), part, uncovered)) {
+        refused <- c(refused, u); next
+      }
+      rows <- rbind(rows, add)
+      days <- rbind(days, data.frame(date = u, method = method,
         run_id = as.integer(run_id), packages = sum(pos),
         downloads = as.integer(sum(cu)), stringsAsFactors = FALSE))
-      known <- c(known, u); progress <- TRUE
+      known <- c(known, u); since <- c(since, held); partial <- part; progress <- TRUE
     }
     if (!progress) break
   }
@@ -705,9 +728,176 @@ solve_days <- function(eqs, daily, known, floor, run_id) {
   all <- rbind(daily, rows)
   for (e in eqs) {
     d <- names(e$coef)
-    if (any(d < floor) || !all(d %in% known) || nrow(e$value) == 0) next
+    if (any(d < floor) || !all(d %in% known) || !.confirmed(e, since)) next
+    e <- .covered(e, partial, uncovered)
+    if (nrow(e$value) == 0) next
     ks <- .signed_sums(all, e$coef, d, e$value$package)
     bad <- union(bad, e$value$package[e$value$value != ks[e$value$package]])
   }
   list(rows = rows, days = days, rejected = length(unique(refused)), residual = length(bad))
+}
+
+# TRUE when every `soft` day of the equation, other than the day being solved,
+# was already held when the run that assumed it read its windows.
+.confirmed <- function(e, since, u = NA_character_) {
+  for (i in seq_along(e$soft)) {
+    s <- names(e$soft)[i]
+    if (identical(s, u)) next
+    if (!isTRUE(unname(since[s]) <= e$soft[[i]])) return(FALSE)
+  }
+  TRUE
+}
+
+# An equation over a `partial` day keeps only the packages that day covers.
+.covered <- function(e, partial, uncovered) {
+  if (length(uncovered) == 0 || !any(names(e$coef) %in% partial)) return(e)
+  e$value <- e$value[!(e$value$package %in% uncovered), , drop = FALSE]
+  e$method <- "release"
+  e
+}
+
+.agrees <- function(eqs, all, known, u, floor, since, partial, uncovered) {
+  for (e in eqs) {
+    d <- names(e$coef)
+    if (!(u %in% d) || any(d < floor) || !all(d %in% known) || !.confirmed(e, since)) next
+    e <- .covered(e, partial, uncovered)
+    if (nrow(e$value) == 0) next
+    ks <- .signed_sums(all, e$coef, d, e$value$package)
+    if (any(e$value$value != ks[e$value$package])) return(FALSE)
+  }
+  TRUE
+}
+
+# The run that first held each stored day: the next day's run for a cnt_1d day
+# stored before run ids were kept, else the run that wrote it.
+days_since <- function(days) {
+  nxt <- as.integer(as.numeric(as.POSIXct(format(as.Date(days$date) + 1L), tz = "UTC")))
+  stats::setNames(ifelse(is.na(days$run_id) & days$method == "cnt_1d", nxt, days$run_id), days$date)
+}
+
+# Dates of a run's 7- and 30-day windows.
+.windows <- function(snapshot_date, window_end) {
+  S <- as.Date(snapshot_date); end <- as.Date(window_end)
+  list(cnt_7d = format(seq(S - 7L, end, by = "day")), cnt_30d = format(seq(S - 30L, end, by = "day")))
+}
+
+# The last window day of a run that did not see the day before it counted.
+.soft_of <- function(run) {
+  if (identical(run$day_aggregated, 1L)) return(NULL)
+  stats::setNames(as.integer(run$run_id), run$window_end)
+}
+
+# For consecutive runs A and B, each window of B minus the same window of A,
+# over the packages both runs counted. It leans on both runs' window ends.
+diff_equations <- function(runs, counters, method = "release") {
+  runs <- runs[order(runs$snapshot_date, runs$run_id), , drop = FALSE]
+  if (nrow(runs) < 2L) return(list())
+  out <- list()
+  for (i in seq_len(nrow(runs) - 1L)) {
+    a <- runs[i, ]; b <- runs[i + 1L, ]
+    wa <- .windows(a$snapshot_date, a$window_end); wb <- .windows(b$snapshot_date, b$window_end)
+    ca <- counters[counters$run_id == a$run_id, , drop = FALSE]
+    cb <- counters[counters$run_id == b$run_id, , drop = FALSE]
+    for (col in c("cnt_7d", "cnt_30d")) {
+      coef <- tapply(c(rep(1, length(wb[[col]])), rep(-1, length(wa[[col]]))),
+                     c(wb[[col]], wa[[col]]), sum)
+      coef <- coef[coef != 0]
+      if (length(coef) == 0) next
+      m <- merge(cb[c("package", col)], ca[c("package", col)], by = "package")
+      m <- m[!is.na(m[[2]]) & !is.na(m[[3]]), , drop = FALSE]
+      out[[length(out) + 1L]] <- list(
+        coef = stats::setNames(as.numeric(coef), names(coef)), method = method,
+        soft = c(.soft_of(a), .soft_of(b)),
+        value = data.frame(package = m$package, value = as.numeric(m[[2]] - m[[3]]),
+                           stringsAsFactors = FALSE))
+    }
+  }
+  out
+}
+
+# Every run's own windows plus the differences of consecutive runs. A day these
+# fill holds only the packages the refill covers, so every equation is 'release'.
+refill_equations <- function(runs, counters) {
+  eqs <- list()
+  for (i in seq_len(nrow(runs))) {
+    cn <- counters[counters$run_id == runs$run_id[i], , drop = FALSE]
+    if (nrow(cn) == 0) next
+    eqs <- c(eqs, run_equations(cn, runs$snapshot_date[i], runs$window_end[i], "release",
+                                sure_end = identical(runs$day_aggregated[i], 1L),
+                                run_id = runs$run_id[i]))
+  }
+  c(eqs, diff_equations(runs, counters))
+}
+
+# An aggregated snapshot must match the stored day before it for every package;
+# one that does not, or whose day before is not stored, is dropped.
+validate_snapshots <- function(runs, counters, daily, known) {
+  keep <- rep(TRUE, nrow(runs)); reason <- rep(NA_character_, nrow(runs))
+  for (i in seq_len(nrow(runs))) {
+    if (!identical(runs$day_aggregated[i], 1L)) next
+    d <- format(as.Date(runs$snapshot_date[i]) - 1L)
+    if (!(d %in% known)) { keep[i] <- FALSE; reason[i] <- "day before the snapshot is not stored"; next }
+    c1 <- counters[counters$run_id == runs$run_id[i] & !is.na(counters$cnt_1d), c("package", "cnt_1d")]
+    st <- daily[daily$date == d, , drop = FALSE]
+    stored <- st$count[match(c1$package, st$package)]
+    stored[is.na(stored)] <- 0L
+    if (any(c1$cnt_1d != stored)) { keep[i] <- FALSE; reason[i] <- "total_1d differs from the stored day" }
+  }
+  list(keep = keep, reason = reason)
+}
+
+# Which packages a refill may rebuild. A snapshot without a package rebuilds its
+# days without it, so a package is left out when an earlier kept snapshot holds
+# it, or when the stored day before the snapshot has a row for it.
+snapshot_cover <- function(runs, counters, daily) {
+  left <- data.frame(package = character(0), first_snapshot = character(0),
+                     missing_from = character(0), reason = character(0), stringsAsFactors = FALSE)
+  if (nrow(runs) == 0) return(list(covered = character(0), left_out = left))
+  runs <- runs[order(runs$snapshot_date, runs$run_id), , drop = FALSE]
+  pos <- match(counters$run_id, runs$run_id)
+  held <- split(pos[!is.na(pos)], counters$package[!is.na(pos)])
+  first <- vapply(held, min, 1L)
+  gap <- stats::setNames(rep(NA_integer_, length(held)), names(held))
+  why <- stats::setNames(rep(NA_character_, length(held)), names(held))
+  for (p in names(held)[lengths(held) < nrow(runs) - first + 1L]) {
+    gap[[p]] <- min(setdiff(seq.int(first[[p]], nrow(runs)), held[[p]]))
+    why[[p]] <- "held by an earlier snapshot"
+  }
+  stored <- split(daily$package, daily$date)
+  for (i in which(runs$day_aggregated %in% 1L)) {
+    d <- format(as.Date(runs$snapshot_date[i]) - 1L)
+    late <- intersect(names(first)[first > i & is.na(gap)], stored[[d]])
+    gap[late] <- i
+    why[late] <- "stored on the day before"
+  }
+  out <- !is.na(gap)
+  if (any(out)) left <- data.frame(
+    package = names(held)[out], first_snapshot = runs$snapshot_date[first[out]],
+    missing_from = runs$snapshot_date[gap[out]], reason = unname(why[out]), stringsAsFactors = FALSE)
+  list(covered = names(held)[!out], left_out = left)
+}
+
+# The refill: validate the imported runs, then solve strictly over every run with
+# counters, from 30 days before the earliest run, with every equation cut to the
+# covered packages. `covered` and `skip` are an earlier refill's choices; they
+# bind this one once a release day is stored.
+refill_solve <- function(runs, counters, import_runs, import_counters, daily, days, run_id,
+                         covered = character(0), skip = character(0)) {
+  v <- validate_snapshots(import_runs, import_counters, daily, days$date)
+  kept <- import_runs[v$keep, , drop = FALSE]
+  kept_cn <- import_counters[import_counters$run_id %in% kept$run_id, , drop = FALSE]
+  cov <- snapshot_cover(kept, kept_cn, daily)
+  if (!("release" %in% days$method)) { covered <- character(0); skip <- character(0) }
+  covered <- setdiff(union(covered, cov$covered), c(cov$left_out$package, skip))
+  all_runs <- merge_runs(runs, kept)
+  all_cn <- rbind(counters, kept_cn)
+  all_cn <- all_cn[all_cn$package %in% covered, , drop = FALSE]
+  all_runs <- all_runs[all_runs$run_id %in% all_cn$run_id & !is.na(all_runs$window_end), , drop = FALSE]
+  res <- if (nrow(all_runs) == 0) list(rows = daily[0, ], days = empty_days(), rejected = 0L, residual = 0L)
+    else solve_days(refill_equations(all_runs, all_cn), daily, days$date,
+                    floor = format(min(as.Date(all_runs$snapshot_date)) - 30L),
+                    run_id = run_id, strict = TRUE, since = days_since(days))
+  c(res, list(kept = kept, covered = covered, left_out = cov$left_out,
+              dropped = data.frame(run_id = import_runs$run_id[!v$keep],
+                                   reason = v$reason[!v$keep], stringsAsFactors = FALSE)))
 }
