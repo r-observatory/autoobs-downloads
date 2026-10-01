@@ -196,6 +196,7 @@ The package-name to MirrorCache-id cache, carried inside `autoobs-downloads-rece
 | `package` | TEXT | RPM package name (PK) |
 | `id` | INTEGER | MirrorCache numeric package id |
 | `autocran_only` | INTEGER | `1` if served only by autoCRAN, `0` if also served elsewhere, `NULL` if not yet classified |
+| `rebuilt` | INTEGER | Set by a refill run: `1` if the refill covered the package, `0` if it left the package out, so its count on a `release` day is unknown. `NULL` for a package first listed after the refill |
 
 ### `autoobs_runs`
 
@@ -203,12 +204,12 @@ One row per run that uploaded the recent shard, heartbeats included. A run that 
 
 | Column | Type | Description |
 |---|---|---|
-| `run_id` | INTEGER | Run start in epoch seconds (PK) |
-| `run_at` | TEXT | Run start, ISO 8601 UTC |
+| `run_id` | INTEGER | Run start in epoch seconds (PK); midnight of the snapshot date for a rebuilt run |
+| `run_at` | TEXT | Run start, ISO 8601 UTC; `NULL` for a rebuilt run |
 | `snapshot_date` | TEXT | UTC date of the run (S) |
-| `source` | TEXT | `run` for a pipeline run |
+| `source` | TEXT | `run` for a pipeline run, or `observatory.db vYYYY-MM-DD` for a run rebuilt from that dated release |
 | `outcome` | TEXT | `ok`, or `heartbeat` when nothing was collected |
-| `reason` | TEXT | Why a heartbeat happened |
+| `reason` | TEXT | Why a heartbeat happened, or `refill` for the run that rebuilt past days |
 | `repos_listed` | INTEGER | autoCRAN repositories whose `primary.xml` was read |
 | `names_listed` | INTEGER | Package names enumerated (0 when enumeration failed and the cached set was used) |
 | `ids_cached` | INTEGER | Names already mapped to MirrorCache ids |
@@ -234,7 +235,7 @@ One row per day that holds data. A day missing here is a hole in the series. Pre
 | Column | Type | Description |
 |---|---|---|
 | `date` | TEXT | The UTC day (PK) |
-| `method` | TEXT | `cnt_1d` (read directly), `window` (solved from the windows) or `upstream_missing` (the windows show MirrorCache never counted the day, so every package is 0) |
+| `method` | TEXT | `cnt_1d` (read directly), `window` (solved from the windows of pipeline runs), `release` (solved in a refill with the counters a dated observatory.db release held, or later from a window that contains such a day; it has rows only for packages with `autoobs_packages.rebuilt` not `0`) or `upstream_missing` (the windows show MirrorCache never counted the day, so every package is 0) |
 | `run_id` | INTEGER | Run that wrote the day; `NULL` for days stored before this table existed |
 | `packages` | INTEGER | Packages with a positive count that day |
 | `downloads` | INTEGER | Sum of the day's counts |
@@ -265,6 +266,27 @@ A run on UTC day S reads `cnt_7d`, covering S-7 through the last day MirrorCache
 - A filled day is written into its year shard, and that shard is listed in `changed_shards`, even when it belongs to the previous year.
 
 A rerun on the same day replaces the attributed day only for packages that returned a count, and only once MirrorCache has counted that day, so a rerun with failed fetches never shrinks a stored day.
+
+## Rebuilding days from dated releases
+
+Before the counters were kept, each daily `r-observatory/data` release still held that day's summary counters. The full history asset in `r-observatory/data` (tag `history`, `history-YYYY-MM-DD.db.zst`, decompressed to `history.db`) keeps them as the series `autoobs_summary`, and `scripts/import_release_snapshots.R` rebuilds one run per autoobs snapshot date from it:
+
+```bash
+Rscript scripts/import_release_snapshots.R history.db autoobs-downloads-recent.db out/ autoobs-counters-recent.db
+```
+
+It keeps one release per autoobs snapshot date, drops a snapshot whose `total_1d` differs from the stored day before it (or whose day before is not stored), writes `autoobs-counters-import.db` (`autoobs_counters`, `autoobs_runs`, `autoobs_import_log` and `autoobs_import_left_out`), and prints the packages a refill would cover and leave out and the days it would fill. The last argument is optional: with the counters asset the preview solves over the same pipeline runs a refill run reads. Rebuilt runs have `cnt_today` and `run_at` `NULL` and hold the packages the summary held that day: every tracked package in the releases made before 2026-07-10, and only packages that are or were on CRAN or Bioconductor in the releases since.
+
+A run dispatched with `refill` then reads that asset from the release, checks the snapshots again, and solves over every rebuilt run, every run in the counters asset and the differences between consecutive runs, from 30 days before the earliest run.
+
+- A snapshot that does not hold a package rebuilds its days without it. So a package is covered only when every kept snapshot from the first one that holds it goes on holding it, and no kept snapshot lacks it on a day the stored series has a row for it. A package that fails either test is left out and listed in `autoobs_import_left_out` with the first snapshot that lacks it. That is what happens to the packages outside the summary's scope: the releases before 2026-07-10 held them and the later ones do not.
+- Every equation is cut to the covered packages, so a counter for any other package is never set against a day that was rebuilt without it. Covered packages are marked `rebuilt = 1` in `autoobs_packages` and every other listed package `0`, and a later refill keeps out what an earlier one left out.
+- A day is written only when every fully known equation that contains it agrees, and is recorded as `release`.
+- A run that did not see the day before it counted is used only once its last window day is confirmed: stored from `cnt_1d`, or solved to a positive count from that run's own windows.
+
+The rebuilt runs join `autoobs_runs`, the filled days join their year shards, and `manifest.json` records the import under `counters.import`, with the number of packages covered (`packages`) and left out (`left_out`).
+
+A `release` day has no row for a package the refill left out, and for that package the day is unknown, not 0. A later run therefore leaves packages with `rebuilt = 0` out of any window that contains a `release` day, both when it fills a day and when it counts `window_residual`, and a day filled from such a window is a `release` day too.
 
 ## Attribution
 
