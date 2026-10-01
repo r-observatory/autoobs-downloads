@@ -6,7 +6,7 @@ Daily per-package download statistics for [autoCRAN](https://build.opensuse.org/
 > **What these numbers mean, and what they do not.**
 >
 > - **Counts are keyed by package name across all of openSUSE, not scoped to autoCRAN.** MirrorCache aggregates downloads by RPM package name over every repository that serves that name. For the long tail of CRAN packages that exist only in autoCRAN (the large majority), the figure is effectively autoCRAN-only. For a package also shipped in the openSUSE distribution or another devel repo (for example a base or recommended R package), the figure is a superset that includes those other repositories. The `autocran_only` column marks which is which: roughly 98% of packages are autoCRAN-only and their counts are exact, while the roughly 2% that are shared are the popular base and recommended packages whose counts are supersets. Use `WHERE autocran_only = 1` when you need exact autoCRAN figures.
-> - **The daily series is built by this pipeline.** MirrorCache does not expose a historical time series, only rolling counters. Each run reads `cnt_1d` (the trailing-day count) and stores it as the count for the UTC day that just ended. The per-day series in `autoobs_downloads_daily` therefore begins on this pipeline's first run.
+> - **The daily series is built by this pipeline.** MirrorCache does not expose a historical time series, only rolling counters. Each run reads `cnt_1d` (the trailing-day count) and stores it as the count for the UTC day that just ended. The per-day series in `autoobs_downloads_daily` therefore begins on this pipeline's first run. MirrorCache counts a day late and at no fixed hour, so some runs find the day not yet counted; those days are filled at a later run from the 7- and 30-day windows (see [How a missed day is filled](#how-a-missed-day-is-filled)), and `autoobs_days` says which days hold data.
 > - **The summary windows come from MirrorCache directly.** `total_7d`, `total_30d`, and `cnt_total` in `autoobs_downloads_summary` are MirrorCache's own rolling counters as of the latest snapshot, so the summary is meaningful from the first run. `trend` is computed from this pipeline's accumulated daily series and is therefore `NULL` until roughly 60 days of history exist.
 > - **`cnt_total` is not a lifetime count.** It is MirrorCache's retained total: the sum of the rows MirrorCache keeps at the package's newest "total" timestamp. On 2026-09-30 it was 0 for 24,918 of 28,832 packages and often smaller than `total_30d`. Prefer the rolling windows.
 > - **Counts include mirror and bot traffic.** Downloads are redirect events at the openSUSE download host and include mirrors, CI systems, containers, and crawlers. Treat the figures as relative popularity and trend signals, not as distinct human installs.
@@ -159,7 +159,7 @@ SELECT package, total_30d, rank_30d
 
 ### `autoobs_downloads_daily`
 
-One row per package per day. The count is MirrorCache's trailing-day `cnt_1d` attributed to the UTC day that just ended; zero-count days are omitted to keep the long-tail series compact. Present in `autoobs-downloads-recent.db` (last 400 days) and each `autoobs-downloads-YYYY.db` archive.
+One row per package per day. The count is MirrorCache's trailing-day `cnt_1d` attributed to the UTC day that just ended, or a value solved from the windows for a day filled later; zero-count days are omitted to keep the long-tail series compact, so read `autoobs_days` to tell a zero from a day with no data. Present in `autoobs-downloads-recent.db` (last 400 days) and each `autoobs-downloads-YYYY.db` archive.
 
 | Column | Type | Description |
 |---|---|---|
@@ -220,10 +220,25 @@ One row per run that uploaded the recent shard, heartbeats included. A run that 
 | `pos_today`, `pos_1d`, `pos_7d`, `pos_30d`, `pos_total` | INTEGER | Packages with a positive value of each counter |
 | `sum_1d`, `sum_7d`, `sum_30d` | INTEGER | Sums of those counters |
 | `day_aggregated` | INTEGER | `1` when any `cnt_1d` was positive, meaning MirrorCache had counted day S-1 |
-| `window_end` | TEXT | Last day inside the run's windows: S-1 when aggregated, else S-2 |
+| `window_end` | TEXT | Last day the run's windows can reach: S-1 when aggregated, else S-2 at best |
+| `days_filled` | INTEGER | Days this run solved from its windows, including days recorded as `upstream_missing` |
+| `fill_rejected` | INTEGER | Days a window would have filled but refused because a package came out negative |
+| `window_residual` | INTEGER | Packages whose fully known window does not equal the stored days, a sign MirrorCache revised a day after it was stored |
 | `in_scope` | INTEGER | Rows in the summary |
 | `counters_prior` | TEXT | `loaded`, `none` or `download_failed` |
 | `counters_published` | INTEGER | `1` when this run's counters went into the counters asset |
+
+### `autoobs_days`
+
+One row per day that holds data. A day missing here is a hole in the series. Present in `autoobs-downloads-recent.db` (every day) and each `autoobs-downloads-YYYY.db` (that year's days).
+
+| Column | Type | Description |
+|---|---|---|
+| `date` | TEXT | The UTC day (PK) |
+| `method` | TEXT | `cnt_1d` (read directly), `window` (solved from the windows) or `upstream_missing` (the windows show MirrorCache never counted the day, so every package is 0) |
+| `run_id` | INTEGER | Run that wrote the day; `NULL` for days stored before this table existed |
+| `packages` | INTEGER | Packages with a positive count that day |
+| `downloads` | INTEGER | Sum of the day's counts |
 
 ### `autoobs_counters`
 
@@ -238,6 +253,19 @@ In `autoobs-counters-recent.db`. One row per run and package, for runs in the la
 ## How it works
 
 A daily GitHub Actions job (04:00 UTC) enumerates the autoCRAN package names from each openSUSE repository's rpm-md `primary.xml.gz`, resolves any newly seen names to MirrorCache ids (reusing the cached map for the rest), and fetches each package's `stat_download` counters concurrently with a small connection pool to stay polite on the volunteer-run download host. It also classifies each package as autoCRAN-only or shared by reading its `package_locations` (every newly seen name each run, and the full set at most once a week, since repository membership changes slowly). The trailing-day count for every package is appended to the history pulled from the `current` release, the affected year shard plus the rolling `autoobs-downloads-recent.db` and `autoobs-downloads-summary.db` are rebuilt, and only the changed shards are uploaded (with `manifest.json` last, so a crash leaves the prior state authoritative). The run also adds its row to `autoobs_runs` and its raw counters to `autoobs-counters-recent.db`, dropping runs older than 40 days. That asset is not the durable record, so when it cannot be downloaded the run carries on, records `download_failed`, and leaves the asset on the release as it was. When MirrorCache is unreachable the run is a heartbeat: it adds its row to `autoobs_runs` in the recent shard, uploads that shard, and leaves the daily series and summary as they were.
+
+## How a missed day is filled
+
+A run on UTC day S reads `cnt_7d`, covering S-7 through the last day MirrorCache has counted, and `cnt_30d`, covering S-30 through the same day. That last day is S-1 when any package has a positive `cnt_1d`, and otherwise S-2 at the latest (`window_end` in `autoobs_runs`). Each window, and the 30-day window minus the 7-day one, is an equation: the counter equals the sum of the daily counts over its days. When exactly one day in a window is missing from `autoobs_days`, and no day falls before the first stored day, each package's count for that day is the counter minus the stored counts on the window's other days, with 0 for a known day where the package has no row. The run repeats this until no window has a single missing day.
+
+- If any package comes out negative, the day is refused and counted in `fill_rejected`.
+- If the day sums to 0 across all packages, it is recorded as `upstream_missing` and gets no rows.
+- A run that found the day before it not yet counted (`day_aggregated` 0) cannot tell whether MirrorCache had counted S-2 either. When S-2 is the missing day and comes out as 0, the run leaves it missing instead of recording `upstream_missing`, because MirrorCache may only be more than a day late. A later run fills the day once one of its windows holds it as the only missing day.
+- When such a run has no positive `cnt_7d` for any package, MirrorCache may be more than a week behind, and the 30-day window minus the 7-day one then stops at the last day it counted and does not reach S-8. When S-8 is the missing day and comes out as 0, the run leaves it missing in the same way.
+- A package with no counters in the run gets no row on a filled day.
+- A filled day is written into its year shard, and that shard is listed in `changed_shards`, even when it belongs to the previous year.
+
+A rerun on the same day replaces the attributed day only for packages that returned a count, and only once MirrorCache has counted that day, so a rerun with failed fetches never shrinks a stored day.
 
 ## Attribution
 
