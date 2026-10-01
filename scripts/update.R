@@ -7,9 +7,10 @@
 # count (cnt_1d) as one point in the per-day series, and re-exports the affected
 # year shard plus the recent and summary shards. An ok run adds a row to
 # autoobs_runs and, unless the prior counters asset failed to download, its raw
-# counters to that asset. When MirrorCache is unreachable the run is a
-# heartbeat: it records its row in the recent shard and leaves the series and
-# summary as they were.
+# counters to that asset. It also fills missed days from the 7- and 30-day
+# windows (autoobs_days marks which days hold data). When MirrorCache is
+# unreachable the run is a heartbeat: it records its row in the recent shard
+# and leaves the series and summary as they were.
 # run_update(io, out_dir) takes an injectable io for offline testing.
 
 options(timeout = 600)
@@ -151,6 +152,8 @@ run_update <- function(io, out_dir, force_full = FALSE,
     DBI::dbDisconnect(rc)
     load_daily(recent_path)
   }
+  days_prev <- read_days(recent_path)
+  if (is.null(days_prev)) days_prev <- bootstrap_days(daily_hist)
 
   # A heartbeat only runs with a prior release, so the downloaded recent shard is
   # on disk; its row goes there and nothing else changes.
@@ -249,9 +252,35 @@ run_update <- function(io, out_dir, force_full = FALSE,
       }
     }
   }
-  daily_hist <- daily_hist[daily_hist$date != attribute_date, , drop = FALSE]
-  daily_all  <- rbind(daily_hist, daily_today)
-  daily_all  <- daily_all[!duplicated(daily_all[c("package", "date")]), , drop = FALSE]
+  # Replace the attributed day per package, and only once MirrorCache has counted
+  # it, so a rerun with failed fetches never shrinks a stored day.
+  day_aggregated <- identical(rec$day_aggregated, 1L)
+  if (day_aggregated) {
+    have <- stats_df$package[!is.na(stats_df$cnt_1d)]
+    daily_hist <- daily_hist[!(daily_hist$date == attribute_date &
+                               daily_hist$package %in% have), , drop = FALSE]
+  }
+  daily_all <- rbind(daily_hist, daily_today)
+  daily_all <- daily_all[!duplicated(daily_all[c("package", "date")]), , drop = FALSE]
+  days_all  <- days_prev
+  if (day_aggregated)
+    days_all <- upsert_days(days_all, day_rows(daily_all, attribute_date, "cnt_1d", run_id))
+
+  # Fill missed days from this run's windows. When the day before was not
+  # counted, the last window day may not have been either (sure_end).
+  fill <- list(rows = daily_all[0, c("package", "date", "count")], days = empty_days(),
+               rejected = 0L, residual = 0L)
+  if (nrow(days_all) > 0) {
+    fill <- solve_days(run_equations(stats_df, snap_str, rec$window_end, "window",
+                                     sure_end = day_aggregated, run_id = run_id),
+                       daily_all[c("package", "date", "count")], days_all$date,
+                       floor = min(days_all$date), run_id = run_id)
+    daily_all <- rbind(daily_all[c("package", "date", "count")], fill$rows)
+    days_all  <- upsert_days(days_all, fill$days)
+  }
+  rec$days_filled     <- nrow(fill$days)
+  rec$fill_rejected   <- as.integer(fill$rejected)
+  rec$window_residual <- as.integer(fill$residual)
 
   # Classify packages as autoCRAN-only vs also-shipped-elsewhere (via
   # package_locations): always for newly-seen names, and for the whole set at most
@@ -323,19 +352,21 @@ run_update <- function(io, out_dir, force_full = FALSE,
   runs_all     <- merge_runs(runs_prev, run_row(rec))
 
   years <- if (isTRUE(force_full) && nrow(daily_all) > 0)
-    sort(unique(substr(daily_all$date, 1, 4))) else substr(attribute_date, 1, 4)
+    sort(unique(substr(daily_all$date, 1, 4))) else
+    sort(unique(substr(c(attribute_date, fill$days$date), 1, 4)))
   changed_shards <- character(0); shard_updates <- list()
   for (yr in years) {
     shard <- sprintf("autoobs-downloads-%s.db", yr)
     dy <- daily_all[substr(daily_all$date, 1, 4) == yr, , drop = FALSE]
-    export_shard(file.path(out_dir, shard), dy)
+    export_shard(file.path(out_dir, shard), dy,
+                 days_df = days_all[substr(days_all$date, 1, 4) == yr, , drop = FALSE])
     changed_shards <- c(changed_shards, shard)
     shard_updates[[shard]] <- coverage(dy)
   }
 
   win_cut <- format(snapshot_date - RECENT_WINDOW_DAYS, "%Y-%m-%d")
   r_rows  <- daily_all[daily_all$date >= win_cut, , drop = FALSE]
-  export_shard(recent_path, r_rows)
+  export_shard(recent_path, r_rows, days_df = days_all)
   embed_aux(recent_path, summary_df, cache)
   write_runs(recent_path, runs_all)
   summary_out <- file.path(out_dir, "autoobs-downloads-summary.db")

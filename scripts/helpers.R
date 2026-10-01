@@ -120,8 +120,9 @@ unix_to_date <- function(x) {
   format(as.POSIXct(as.numeric(x), origin = "1970-01-01", tz = "UTC"), "%Y-%m-%d")
 }
 
-# Write the daily-series table for one shard. daily_df has (package, date, count).
-export_shard <- function(path, daily_df) {
+# Write the daily-series table for one shard. daily_df has (package, date, count);
+# days_df, when given, is written as autoobs_days beside it.
+export_shard <- function(path, daily_df, days_df = NULL) {
   if (file.exists(path)) unlink(path)
   con <- DBI::dbConnect(RSQLite::SQLite(), path)
   on.exit(DBI::dbDisconnect(con), add = TRUE)
@@ -137,6 +138,7 @@ export_shard <- function(path, daily_df) {
     DBI::dbWriteTable(con, "autoobs_downloads_daily",
       daily_df[c("package", "date", "count")], append = TRUE)
   }
+  if (!is.null(days_df)) write_days(con, days_df)
   DBI::dbExecute(con, "VACUUM")
   invisible(NULL)
 }
@@ -309,6 +311,9 @@ RUNS_SCHEMA <- c(
   sum_30d            = "INTEGER",
   day_aggregated     = "INTEGER",
   window_end         = "TEXT",
+  days_filled        = "INTEGER",
+  fill_rejected      = "INTEGER",
+  window_residual    = "INTEGER",
   in_scope           = "INTEGER",
   counters_prior     = "TEXT",
   counters_published = "INTEGER")
@@ -570,4 +575,139 @@ write_release_notes <- function(path, manifest) {
     "```")
   writeLines(lines, path)
   invisible(NULL)
+}
+
+# autoobs_days: which dates hold data. A date absent here is a hole; a date with
+# no daily rows but a row here is a true zero ('upstream_missing').
+DAYS_DDL <- "CREATE TABLE autoobs_days (
+  date      TEXT PRIMARY KEY,
+  method    TEXT NOT NULL,
+  run_id    INTEGER,
+  packages  INTEGER,
+  downloads INTEGER)"
+
+empty_days <- function() data.frame(date = character(0), method = character(0),
+  run_id = integer(0), packages = integer(0), downloads = integer(0), stringsAsFactors = FALSE)
+
+write_days <- function(con, days) {
+  DBI::dbExecute(con, "DROP TABLE IF EXISTS autoobs_days")
+  DBI::dbExecute(con, DAYS_DDL)
+  if (nrow(days) > 0)
+    DBI::dbWriteTable(con, "autoobs_days", days[names(empty_days())], append = TRUE)
+}
+
+# NULL when the shard predates the table, so the caller can bootstrap it.
+read_days <- function(path) {
+  if (!file.exists(path)) return(NULL)
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  if (!"autoobs_days" %in% DBI::dbListTables(con)) return(NULL)
+  d <- DBI::dbReadTable(con, "autoobs_days")
+  d$run_id <- as.integer(d$run_id); d$packages <- as.integer(d$packages)
+  d$downloads <- as.integer(d$downloads)
+  d[names(empty_days())]
+}
+
+# One row per date for the given daily rows.
+day_rows <- function(daily, dates, method, run_id) {
+  if (length(dates) == 0) return(empty_days())
+  do.call(rbind, lapply(dates, function(d) {
+    x <- daily$count[daily$date == d]
+    data.frame(date = d, method = method, run_id = as.integer(run_id),
+               packages = length(x), downloads = as.integer(sum(x)), stringsAsFactors = FALSE)
+  }))
+}
+
+# Every date already in the series was stored from that run's cnt_1d.
+bootstrap_days <- function(daily) {
+  day_rows(daily, sort(unique(daily$date)), "cnt_1d", NA_integer_)
+}
+
+upsert_days <- function(days, new) {
+  all <- rbind(new, days)
+  all <- all[!duplicated(all$date), , drop = FALSE]
+  all <- all[order(all$date), , drop = FALSE]
+  rownames(all) <- NULL
+  all
+}
+
+# One run's equations: W7 = [S-7, window_end], W30 = [S-30, window_end] and
+# W30 minus W7, each a +1 per date and the matching counter per package. A run
+# that did not see the day before it counted cannot tell whether window_end was
+# counted either (`sure_end` FALSE), so W7 and W30 carry that day as `soft`.
+# With no 7-day counts at all on such a run, W30 minus W7 carries S-8 as `soft`.
+run_equations <- function(counters, snapshot_date, window_end, method = "window",
+                          sure_end = TRUE, run_id = NA_integer_) {
+  S <- as.Date(snapshot_date); end <- as.Date(window_end)
+  w7  <- format(seq(S - 7L,  end, by = "day"))
+  w30 <- format(seq(S - 30L, end, by = "day"))
+  soft <- if (isTRUE(sure_end)) NULL else stats::setNames(as.integer(run_id), format(end))
+  eq <- function(dates, v, soft = NULL) {
+    ok <- !is.na(v)
+    list(coef = stats::setNames(rep(1, length(dates)), dates), method = method, soft = soft,
+         value = data.frame(package = counters$package[ok], value = as.numeric(v[ok]),
+                            stringsAsFactors = FALSE))
+  }
+  # With no positive cnt_7d on such a run MirrorCache may be more than a week
+  # behind, and then W30 minus W7 does not reach S-8 either.
+  soft8 <- if (isTRUE(sure_end) || any(counters$cnt_7d > 0, na.rm = TRUE)) NULL else
+    stats::setNames(as.integer(run_id), format(S - 8L))
+  list(eq(w7, counters$cnt_7d, soft), eq(w30, counters$cnt_30d, soft),
+       eq(setdiff(w30, w7), counters$cnt_30d - counters$cnt_7d, soft8))
+}
+
+# Per-package sum of coef x count over the given dates (0 where a package has no row).
+.signed_sums <- function(daily, coef, dates, packages) {
+  out <- stats::setNames(numeric(length(packages)), packages)
+  sel <- daily$date %in% dates & daily$package %in% packages
+  if (any(sel)) {
+    w <- rowsum(daily$count[sel] * unname(coef[daily$date[sel]]), daily$package[sel])
+    out[rownames(w)] <- w[, 1]
+  }
+  out
+}
+
+# Solve, one day at a time, every equation with exactly one unknown date and no
+# date before `floor`. A negative package refuses the day; a day summing to 0 is
+# 'upstream_missing' with no rows, unless it is the equation's own `soft` day,
+# which stays unknown. Fully known equations that do not add up are counted per
+# package in `residual`.
+solve_days <- function(eqs, daily, known, floor, run_id) {
+  rows <- data.frame(package = character(0), date = character(0), count = integer(0),
+                     stringsAsFactors = FALSE)
+  days <- empty_days(); refused <- character(0)
+  repeat {
+    progress <- FALSE
+    for (e in eqs) {
+      d <- names(e$coef)
+      if (any(d < floor) || nrow(e$value) == 0) next
+      unk <- setdiff(d, known)
+      if (length(unk) != 1L || unk %in% refused) next
+      u <- unk
+      ks <- .signed_sums(rbind(daily, rows), e$coef, setdiff(d, u), e$value$package)
+      cu <- (e$value$value - ks[e$value$package]) / e$coef[[u]]
+      if (any(cu < 0)) { refused <- c(refused, u); next }
+      # Zero on the run's unsure last day may only mean MirrorCache was late.
+      if (u %in% names(e$soft) && sum(cu) == 0) next
+      pos <- cu > 0
+      if (any(pos))
+        rows <- rbind(rows, data.frame(package = e$value$package[pos], date = u,
+                                       count = as.integer(cu[pos]), stringsAsFactors = FALSE))
+      days <- rbind(days, data.frame(date = u,
+        method = if (any(pos)) e$method else "upstream_missing",
+        run_id = as.integer(run_id), packages = sum(pos),
+        downloads = as.integer(sum(cu)), stringsAsFactors = FALSE))
+      known <- c(known, u); progress <- TRUE
+    }
+    if (!progress) break
+  }
+  bad <- character(0)
+  all <- rbind(daily, rows)
+  for (e in eqs) {
+    d <- names(e$coef)
+    if (any(d < floor) || !all(d %in% known) || nrow(e$value) == 0) next
+    ks <- .signed_sums(all, e$coef, d, e$value$package)
+    bad <- union(bad, e$value$package[e$value$value != ks[e$value$package]])
+  }
+  list(rows = rows, days = days, rejected = length(unique(refused)), residual = length(bad))
 }
