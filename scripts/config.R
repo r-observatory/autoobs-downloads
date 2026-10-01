@@ -45,3 +45,9 @@ BIOC_META_REPO    <- "r-observatory/bioconductor-metadata"
 BIOC_META_DB      <- "bioconductor-metadata.db"
 CRAN_NAMES_FLOOR  <- 15000L   # below this the identity fetch is treated as partial
 BIOC_NAMES_FLOOR  <- 1500L
+
+# Raw MirrorCache counters from ok runs, kept for the last COUNTERS_WINDOW_DAYS
+# days in one rolling asset. autoobs_runs and the daily series are the durable
+# record, so a failed download of this asset never stops a run.
+COUNTERS_ASSET       <- "autoobs-counters-recent.db"
+COUNTERS_WINDOW_DAYS <- 40L

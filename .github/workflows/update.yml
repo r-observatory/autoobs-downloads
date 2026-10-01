@@ -63,6 +63,12 @@ jobs:
               --notes-file out/release_notes.md \
               --latest
           fi
+          # Counters first, so a failed upload leaves the prior manifest in place.
+          if [ "$(jq -r '.counters.published // false' out/manifest.json)" = "true" ]; then
+            COUNTERS_ASSET=$(jq -r '.counters.asset' out/manifest.json)
+            echo "Uploading $COUNTERS_ASSET..."
+            gh release upload current "out/$COUNTERS_ASSET" --clobber
+          fi
           CHANGED=$(jq -r '.changed_shards[]' out/manifest.json)
           for asset in $CHANGED; do
             if [ -f "out/$asset" ]; then

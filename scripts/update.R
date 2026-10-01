@@ -5,8 +5,11 @@
 # resolves any new names to MirrorCache ids (cached across runs), fetches the
 # current per-package download windows from MirrorCache, records the trailing-day
 # count (cnt_1d) as one point in the per-day series, and re-exports the affected
-# year shard plus the recent and summary shards. When MirrorCache is unreachable
-# the run is a cheap heartbeat that leaves the prior release intact.
+# year shard plus the recent and summary shards. An ok run adds a row to
+# autoobs_runs and, unless the prior counters asset failed to download, its raw
+# counters to that asset. When MirrorCache is unreachable the run is a
+# heartbeat: it records its row in the recent shard and leaves the series and
+# summary as they were.
 # run_update(io, out_dir) takes an injectable io for offline testing.
 
 options(timeout = 600)
@@ -63,6 +66,33 @@ resolve_gated_identity <- function(io, names, cran_floor, bioc_floor) {
   resolve_identities(names, maps)
 }
 
+# State of the prior counters asset: "loaded", "none" (no prior window, or the
+# release confirms the listed asset is gone) or "download_failed". Never stops
+# the run: the counters are not the durable record.
+prior_counters_state <- function(io, prev, out_dir) {
+  if (is.null(prev$counters)) return("none")
+  path <- file.path(out_dir, COUNTERS_ASSET)
+  code <- tryCatch(io$release_download(COUNTERS_ASSET, out_dir), error = function(e) 1L)
+  if (identical(as.integer(code), 0L) && counters_readable(path)) return("loaded")
+  unlink(path)
+  assets <- tryCatch(io$release_asset_names(), error = function(e) NULL)
+  if (!is.null(assets) && !(COUNTERS_ASSET %in% assets)) return("none")
+  "download_failed"
+}
+
+counters_entry <- function(prev, state, cst = NULL, window_days = COUNTERS_WINDOW_DAYS) {
+  if (identical(state, "download_failed")) {
+    m <- prev$counters
+    m$published <- FALSE
+    m$prior <- state
+    return(m)
+  }
+  at <- function(x) iso(as.POSIXct(as.numeric(x), origin = "1970-01-01", tz = "UTC"))
+  list(asset = COUNTERS_ASSET, published = TRUE, prior = state,
+       window_days = window_days, rows = cst$rows, runs = cst$runs,
+       first_run = at(cst$first_run), last_run = at(cst$last_run))
+}
+
 run_update <- function(io, out_dir, force_full = FALSE,
                        cran_floor = CRAN_NAMES_FLOOR, bioc_floor = BIOC_NAMES_FLOOR) {
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
@@ -89,6 +119,9 @@ run_update <- function(io, out_dir, force_full = FALSE,
   snapshot_date  <- as.Date(format(now, "%Y-%m-%d", tz = "UTC"))
   snap_str       <- format(snapshot_date, "%Y-%m-%d")
   attribute_date <- format(snapshot_date - 1L, "%Y-%m-%d")  # cnt_1d ~ the day just ended
+  run_id         <- as.integer(floor(as.numeric(now)))
+  rec            <- list(run_id = run_id, run_at = iso(now), snapshot_date = snap_str,
+                         source = "run")
 
   cache      <- data.frame(package = character(0), id = integer(0),
                            autocran_only = integer(0), origin = character(0),
@@ -104,7 +137,9 @@ run_update <- function(io, out_dir, force_full = FALSE,
       daily_hist <<- rbind(daily_hist,
         DBI::dbGetQuery(c2, "SELECT package, date, count FROM autoobs_downloads_daily"))
   }
+  runs_prev <- normalize_runs(data.frame())
   if (file.exists(recent_path)) {
+    runs_prev <- read_runs(recent_path)
     rc <- DBI::dbConnect(RSQLite::SQLite(), recent_path)
     if ("autoobs_packages" %in% DBI::dbListTables(rc)) {
       cache <- DBI::dbGetQuery(rc, "SELECT * FROM autoobs_packages")
@@ -117,23 +152,36 @@ run_update <- function(io, out_dir, force_full = FALSE,
     load_daily(recent_path)
   }
 
+  # A heartbeat only runs with a prior release, so the downloaded recent shard is
+  # on disk; its row goes there and nothing else changes.
   heartbeat <- function(reason) {
+    stopifnot(file.exists(recent_path))
+    hb <- rec
+    hb$outcome <- "heartbeat"
+    hb$reason  <- reason
+    write_runs(recent_path, merge_runs(runs_prev, run_row(hb)))
     out <- if (length(prev) > 0) prev else list()
     out$last_checked   <- iso(now)
     out$source_kind    <- "frozen"
-    out$changed_shards <- list()
+    out$changed_shards <- list("autoobs-downloads-recent.db")
+    if (!is.null(out$counters)) out$counters$published <- FALSE
     write_manifest(manifest_path, out)
     write_release_notes(file.path(out_dir, "release_notes.md"), out)
     message("heartbeat: ", reason)
-    list(changed_shards = character(0), manifest = out)
+    list(changed_shards = "autoobs-downloads-recent.db", manifest = out)
   }
 
   # Enumerate package names; fall back to the cached set if enumeration fails.
   names <- tryCatch(io$list_packages(), error = function(e) character(0))
+  rec$names_listed <- length(names)
+  rec$repos_listed <- as.integer(attr(names, "repos_listed") %||% NA_integer_)
+  rec$ids_cached   <- nrow(cache)
+  rec$ids_new      <- 0L
   if (length(names) == 0) names <- cache$package
   new_names <- setdiff(names, cache$package)
   if (length(new_names) > 0) {
     resolved <- tryCatch(io$resolve_ids(new_names), error = function(e) NULL)
+    if (!is.null(resolved)) rec$ids_new <- sum(!is.na(resolved$id))
     if (!is.null(resolved) && nrow(resolved) > 0) {
       resolved$autocran_only  <- NA_integer_
       resolved$origin         <- NA_character_
@@ -150,7 +198,10 @@ run_update <- function(io, out_dir, force_full = FALSE,
     return(heartbeat("no packages resolved"))
   }
 
+  rec$stats_requested <- length(cache$id)
   stats <- tryCatch(io$fetch_stats(cache$id), error = function(e) NULL)
+  rec$stats_responded <- if (!is.null(stats) && "responded" %in% colnames(stats))
+    as.integer(sum(stats$responded, na.rm = TRUE)) else NA_integer_
   if (is.null(stats) || nrow(stats) == 0) {
     if (length(prev) == 0)
       stop("MirrorCache returned no stats and no prior release exists; cannot bootstrap")
@@ -165,11 +216,26 @@ run_update <- function(io, out_dir, force_full = FALSE,
   all_na <- is.na(stats_df$cnt_1d) & is.na(stats_df$cnt_7d) &
             is.na(stats_df$cnt_30d) & is.na(stats_df$cnt_total)
   stats_df <- stats_df[!all_na, , drop = FALSE]
+  rec$stats_non_na <- nrow(stats_df)
   if (nrow(stats_df) == 0) {
     if (length(prev) == 0)
       stop("MirrorCache returned only empty stats and no prior release exists; cannot bootstrap")
     return(heartbeat("all stat fetches returned empty"))
   }
+  rec <- utils::modifyList(rec, counter_stats(stats_df))
+  rec$window_end <- window_end_for(snap_str, rec$day_aggregated)
+
+  # Raw counters for every package that returned numbers, in scope or not.
+  counters_path  <- file.path(out_dir, COUNTERS_ASSET)
+  counters_prior <- prior_counters_state(io, prev, out_dir)
+  counters_keep  <- as.integer(as.numeric(as.POSIXct(
+    format(snapshot_date - COUNTERS_WINDOW_DAYS + 1L, "%Y-%m-%d"), tz = "UTC")))
+  cst <- NULL
+  if (counters_prior != "download_failed")
+    cst <- update_counters(counters_path, counters_rows(stats_df, run_id),
+                           keep_from = counters_keep, fresh = counters_prior == "none")
+  rec$counters_prior     <- counters_prior
+  rec$counters_published <- as.integer(!is.null(cst))
 
   daily_today <- build_daily_rows(stats_df, attribute_date)
 
@@ -252,6 +318,9 @@ run_update <- function(io, out_dir, force_full = FALSE,
   }
   summary_df <- build_summary(con, stats_df, attribute_date, snap_str,
                               identity_df = identity_df, autocran_map = cache)
+  rec$in_scope <- nrow(summary_df)
+  rec$outcome  <- "ok"
+  runs_all     <- merge_runs(runs_prev, run_row(rec))
 
   years <- if (isTRUE(force_full) && nrow(daily_all) > 0)
     sort(unique(substr(daily_all$date, 1, 4))) else substr(attribute_date, 1, 4)
@@ -268,8 +337,10 @@ run_update <- function(io, out_dir, force_full = FALSE,
   r_rows  <- daily_all[daily_all$date >= win_cut, , drop = FALSE]
   export_shard(recent_path, r_rows)
   embed_aux(recent_path, summary_df, cache)
+  write_runs(recent_path, runs_all)
   summary_out <- file.path(out_dir, "autoobs-downloads-summary.db")
   export_summary_shard(summary_out, summary_df)
+  write_runs(summary_out, runs_all)
   changed_shards <- c(changed_shards, "autoobs-downloads-recent.db", "autoobs-downloads-summary.db")
   shard_updates[["autoobs-downloads-recent.db"]] <- coverage(r_rows)
 
@@ -284,6 +355,7 @@ run_update <- function(io, out_dir, force_full = FALSE,
     last_classified = if (isTRUE(classified_full)) iso(now) else (prev$last_classified %||% NULL),
     changed_shards = as.list(changed_shards),
     shards         = merge_shard_coverage(prev_shards, shard_updates),
+    counters       = counters_entry(prev, counters_prior, cst),
     summary        = list(
       packages         = nrow(summary_df),
       in_scope         = nrow(summary_df),
@@ -383,6 +455,7 @@ default_io <- function() {
     },
     list_packages = function() {
       all_names <- character(0)
+      n_ok <- 0L
       for (repo in AUTOCRAN_REPOS) {
         repo_url <- paste0(AUTOCRAN_REPO_BASE, "/", repo, "/")
         repomd <- tryCatch(rawToChar(with_retry(curl::curl_fetch_memory(
@@ -397,12 +470,14 @@ default_io <- function() {
                        error = function(e) FALSE)
         if (!ok) { message("primary download failed: ", repo); next }
         zc <- gzfile(tf, "rt"); lines <- readLines(zc, warn = FALSE); close(zc); unlink(tf)
+        n_ok <- n_ok + 1L
         all_names <- union(all_names, parse_primary_names(lines))
         message("enumerated ", repo, ": running union ", length(all_names))
       }
       all_names <- sort(unique(all_names), method = "radix")
       if (PACKAGE_LIMIT > 0L && length(all_names) > PACKAGE_LIMIT)
         all_names <- all_names[seq_len(PACKAGE_LIMIT)]
+      attr(all_names, "repos_listed") <- n_ok
       all_names
     },
     resolve_ids = function(names) {
@@ -427,6 +502,7 @@ default_io <- function() {
         cnt_30d    = vapply(parsed, function(p) p$cnt_30d,    integer(1)),
         cnt_total  = vapply(parsed, function(p) p$cnt_total,  integer(1)),
         first_seen = vapply(parsed, function(p) p$first_seen, integer(1)),
+        responded  = as.integer(!vapply(res, is.null, logical(1))),
         stringsAsFactors = FALSE)
     },
     fetch_locations = function(names) {
@@ -437,6 +513,14 @@ default_io <- function() {
       ao   <- vapply(res, function(x)
         if (is.null(x)) NA_integer_ else classify_autocran_only(parse_location_paths(x)), integer(1))
       data.frame(package = names, autocran_only = ao, stringsAsFactors = FALSE)
+    },
+    release_asset_names = function() {
+      out <- suppressWarnings(system2("gh",
+        c("release", "view", "current", "--repo", PUBLISH_REPO,
+          "--json", "assets", "--jq", ".assets[].name"),
+        stdout = TRUE, stderr = FALSE))
+      if (!identical(as.integer(attr(out, "status") %||% 0L), 0L)) return(NULL)
+      as.character(out)
     },
     identity_dbs = function() {
       tmp <- tempfile(); dir.create(tmp, showWarnings = FALSE)

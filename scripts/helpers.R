@@ -283,6 +283,151 @@ merge_shard_coverage <- function(prev, updates) {
   out
 }
 
+# autoobs_runs: one row per run, heartbeats included. The column list drives the
+# DDL, the typed empty frame and the fill-in of columns an older table lacks.
+RUNS_SCHEMA <- c(
+  run_id             = "INTEGER PRIMARY KEY",
+  run_at             = "TEXT",
+  snapshot_date      = "TEXT NOT NULL",
+  source             = "TEXT NOT NULL",
+  outcome            = "TEXT NOT NULL",
+  reason             = "TEXT",
+  repos_listed       = "INTEGER",
+  names_listed       = "INTEGER",
+  ids_cached         = "INTEGER",
+  ids_new            = "INTEGER",
+  stats_requested    = "INTEGER",
+  stats_responded    = "INTEGER",
+  stats_non_na       = "INTEGER",
+  pos_today          = "INTEGER",
+  pos_1d             = "INTEGER",
+  pos_7d             = "INTEGER",
+  pos_30d            = "INTEGER",
+  pos_total          = "INTEGER",
+  sum_1d             = "INTEGER",
+  sum_7d             = "INTEGER",
+  sum_30d            = "INTEGER",
+  day_aggregated     = "INTEGER",
+  window_end         = "TEXT",
+  in_scope           = "INTEGER",
+  counters_prior     = "TEXT",
+  counters_published = "INTEGER")
+
+runs_table_ddl <- function() {
+  sprintf("CREATE TABLE autoobs_runs (\n  %s)",
+          paste(names(RUNS_SCHEMA), RUNS_SCHEMA, collapse = ",\n  "))
+}
+
+# Coerce any frame to the autoobs_runs columns, in order, with NA for absent ones.
+normalize_runs <- function(df) {
+  n <- nrow(df)
+  cols <- lapply(names(RUNS_SCHEMA), function(col) {
+    v <- if (col %in% colnames(df)) df[[col]] else rep(NA, n)
+    if (startsWith(RUNS_SCHEMA[[col]], "INTEGER")) as.integer(v) else as.character(v)
+  })
+  as.data.frame(stats::setNames(cols, names(RUNS_SCHEMA)), stringsAsFactors = FALSE)
+}
+
+read_runs <- function(path) {
+  if (!file.exists(path)) return(normalize_runs(data.frame()))
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  if (!"autoobs_runs" %in% DBI::dbListTables(con)) return(normalize_runs(data.frame()))
+  normalize_runs(DBI::dbReadTable(con, "autoobs_runs"))
+}
+
+write_runs <- function(path, runs) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  DBI::dbWithTransaction(con, {
+    DBI::dbExecute(con, "DROP TABLE IF EXISTS autoobs_runs")
+    DBI::dbExecute(con, runs_table_ddl())
+    if (nrow(runs) > 0)
+      DBI::dbWriteTable(con, "autoobs_runs", normalize_runs(runs), append = TRUE)
+  })
+  invisible(nrow(runs))
+}
+
+# Prior rows plus this run's row; a repeated run_id keeps the newer row.
+merge_runs <- function(prev, new) {
+  all <- rbind(normalize_runs(prev), normalize_runs(new))
+  all <- all[!duplicated(all$run_id, fromLast = TRUE), , drop = FALSE]
+  all <- all[order(all$run_id), , drop = FALSE]
+  rownames(all) <- NULL
+  all
+}
+
+run_row <- function(rec) normalize_runs(as.data.frame(rec, stringsAsFactors = FALSE))
+
+# Per-counter positives and sums for the run record. MirrorCache reports a day
+# only once it has aggregated it, so any positive cnt_1d means S-1 is counted.
+counter_stats <- function(stats_df) {
+  pos <- function(x) as.integer(sum(x > 0, na.rm = TRUE))
+  tot <- function(x) as.integer(sum(as.numeric(x), na.rm = TRUE))
+  list(pos_today = pos(stats_df$cnt_today), pos_1d = pos(stats_df$cnt_1d),
+       pos_7d = pos(stats_df$cnt_7d), pos_30d = pos(stats_df$cnt_30d),
+       pos_total = pos(stats_df$cnt_total),
+       sum_1d = tot(stats_df$cnt_1d), sum_7d = tot(stats_df$cnt_7d),
+       sum_30d = tot(stats_df$cnt_30d),
+       day_aggregated = as.integer(any(stats_df$cnt_1d > 0, na.rm = TRUE)))
+}
+
+# Last day inside this run's windows: S-1 once MirrorCache has aggregated it, else S-2.
+window_end_for <- function(snapshot_date, day_aggregated) {
+  format(as.Date(snapshot_date) - if (isTRUE(as.logical(day_aggregated))) 1L else 2L, "%Y-%m-%d")
+}
+
+COUNTERS_DDL <- "CREATE TABLE IF NOT EXISTS autoobs_counters (
+  run_id    INTEGER NOT NULL,
+  package   TEXT    NOT NULL,
+  cnt_today INTEGER,
+  cnt_1d    INTEGER,
+  cnt_7d    INTEGER,
+  cnt_30d   INTEGER,
+  cnt_total INTEGER,
+  PRIMARY KEY (run_id, package)) WITHOUT ROWID"
+
+counters_rows <- function(stats_df, run_id) {
+  s <- stats_df[!duplicated(stats_df$package), , drop = FALSE]
+  data.frame(run_id = rep(as.integer(run_id), nrow(s)), package = s$package,
+             cnt_today = as.integer(s$cnt_today), cnt_1d = as.integer(s$cnt_1d),
+             cnt_7d = as.integer(s$cnt_7d), cnt_30d = as.integer(s$cnt_30d),
+             cnt_total = as.integer(s$cnt_total), stringsAsFactors = FALSE)
+}
+
+counters_readable <- function(path) {
+  if (!file.exists(path)) return(FALSE)
+  isTRUE(tryCatch({
+    con <- DBI::dbConnect(RSQLite::SQLite(), path, synchronous = NULL)
+    on.exit(DBI::dbDisconnect(con), add = TRUE)
+    identical(DBI::dbGetQuery(con, "PRAGMA quick_check")[[1]][1], "ok") &&
+      "autoobs_counters" %in% DBI::dbListTables(con)
+  }, error = function(e) FALSE))
+}
+
+# Append one run's rows, drop runs before keep_from (epoch seconds), and return
+# the file's rows, runs and first and last run_id.
+update_counters <- function(path, rows, keep_from, fresh = FALSE) {
+  if (isTRUE(fresh) && file.exists(path)) unlink(path)
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  DBI::dbExecute(con, "PRAGMA journal_mode=DELETE")
+  DBI::dbExecute(con, COUNTERS_DDL)
+  DBI::dbWithTransaction(con, {
+    if (nrow(rows) > 0) {
+      DBI::dbExecute(con, "DELETE FROM autoobs_counters WHERE run_id = ?",
+                     params = list(rows$run_id[1]))
+      DBI::dbWriteTable(con, "autoobs_counters", rows, append = TRUE)
+    }
+    DBI::dbExecute(con, "DELETE FROM autoobs_counters WHERE run_id < ?",
+                   params = list(as.integer(keep_from)))
+  })
+  DBI::dbExecute(con, "VACUUM")
+  DBI::dbGetQuery(con, "SELECT COUNT(*) AS rows, COUNT(DISTINCT run_id) AS runs,
+                               MIN(run_id) AS first_run, MAX(run_id) AS last_run
+                          FROM autoobs_counters")
+}
+
 # Compute the lowercase hex SHA-256 of a file's exact on-disk bytes.
 #
 # Uses whatever the runner already provides, in preference order:
@@ -371,6 +516,16 @@ write_manifest <- function(path, obj, core = NULL) {
   writeLines(jsonlite::toJSON(obj, auto_unbox = TRUE, pretty = TRUE, null = "null"), path)
 }
 
+# One line on the counters asset for the release body.
+counters_note <- function(m) {
+  if (is.null(m)) return("not yet published")
+  if (isTRUE(m$published))
+    return(sprintf("`%s`, %s runs over the last %s days", m$asset, m$runs, m$window_days))
+  if (identical(m$prior, "download_failed"))
+    return("not updated this run (the prior window could not be downloaded)")
+  "not updated this run"
+}
+
 # Render the GitHub release body (markdown) from a manifest object.
 write_release_notes <- function(path, manifest) {
   ts  <- function(s) if (is.null(s) || is.na(s)) "n/a" else sub("Z$", " UTC", sub("T", " ", s))
@@ -394,6 +549,7 @@ write_release_notes <- function(path, manifest) {
     sprintf("| **autoCRAN-only (exact counts)** | %s of %s |",
             big(manifest$summary$autocran_only), big(manifest$summary$packages)),
     sprintf("| **Changed this run** | %s |", changed),
+    sprintf("| **Counters asset** | %s |", counters_note(manifest$counters)),
     "",
     "> The remaining packages share an RPM name with the openSUSE distribution or another devel repo, so MirrorCache's count for them is not exclusive to autoCRAN. Filter `WHERE autocran_only = 1` (or sum only those rows) for autoCRAN-only totals.",
     "",

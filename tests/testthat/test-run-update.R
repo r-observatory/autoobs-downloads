@@ -21,7 +21,7 @@ publish <- function(out, pub) {
 fake_io <- function(pub, names, idmap, stats_df, now, log = NULL,
                     stats_ok = TRUE, list_ok = TRUE, only_pkgs = NULL, loc_fail = FALSE,
                     cran = sub("^R-", "", names), bioc = character(0),
-                    fail_identity = FALSE) {
+                    fail_identity = FALSE, assets_ok = TRUE) {
   ident_dir <- tempfile("identity-dbs-"); dir.create(ident_dir)
   cran_db <- file.path(ident_dir, "cran-archive.db")
   bioc_db <- file.path(ident_dir, "bioc-meta.db")
@@ -32,6 +32,10 @@ fake_io <- function(pub, names, idmap, stats_df, now, log = NULL,
     release_download = function(pattern, dir) {
       src <- file.path(pub, pattern)
       if (file.exists(src)) { file.copy(src, file.path(dir, pattern), overwrite = TRUE); 0L } else 1L
+    },
+    release_asset_names = function() {
+      if (!assets_ok) stop("release listing failed")
+      list.files(pub)
     },
     list_packages = function() if (list_ok) names else character(0),
     resolve_ids = function(nm) {
@@ -238,9 +242,23 @@ test_that("run_update heartbeats when MirrorCache stats are unavailable", {
   res <- run_update(fake_io(pub, names, idmap, NULL,
                             as.POSIXct("2026-06-12 04:00:00", tz = "UTC"), stats_ok = FALSE), out2,
                     cran_floor = 1L, bioc_floor = 0L)
-  expect_length(res$changed_shards, 0L)
+  expect_equal(res$changed_shards, "autoobs-downloads-recent.db")   # only its run row changed
   man <- jsonlite::fromJSON(file.path(out2, "manifest.json"), simplifyVector = FALSE)
   expect_equal(man$source_kind, "frozen")
+  expect_false(man$counters$published)
+  prior <- jsonlite::fromJSON(file.path(pub, "manifest.json"), simplifyVector = FALSE)
+  expect_equal(man$db_sha256, prior$db_sha256)       # summary shard untouched, binding intact
+  expect_false(file.exists(file.path(out2, "autoobs-downloads-summary.db")))
+  expect_false(file.exists(file.path(out2, COUNTERS_ASSET)))
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out2, "autoobs-downloads-recent.db"))
+  on.exit(DBI::dbDisconnect(con))
+  runs <- DBI::dbGetQuery(con, "SELECT outcome, reason, stats_requested FROM autoobs_runs ORDER BY run_id")
+  expect_equal(runs$outcome, c("ok", "heartbeat"))
+  expect_equal(runs$reason[2], "no stats fetched")
+  expect_equal(runs$stats_requested[2], 1L)
+  expect_equal(DBI::dbGetQuery(con, "SELECT COUNT(*) n FROM autoobs_downloads_daily")$n, 1L)
+  expect_equal(DBI::dbGetQuery(con, "SELECT COUNT(*) n FROM autoobs_packages")$n, 1L)
 })
 
 test_that("run_update with no prior release and no stats errors", {
@@ -386,4 +404,192 @@ test_that("raw counts survive in the shards while ranks stay dense over in-scope
   man <- jsonlite::fromJSON(file.path(out1, "manifest.json"), simplifyVector = FALSE)
   expect_equal(man$summary$in_scope + man$summary$out_of_scope, man$summary$raw_tracked)
   expect_equal(man$summary$out_of_scope, 2L)
+})
+
+test_that("an ok run records its run row in the recent and summary shards", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  names <- c("R-Rcpp", "R-AER", "R-notacran")
+  idmap <- c("R-Rcpp" = 100L, "R-AER" = 200L, "R-notacran" = 300L)
+  s1 <- day_stats(stats_row(100, cnt_1d = 10, 70, 300, 0, cnt_today = 2),
+                  stats_row(200, cnt_1d = 0,   5,  20, 50),
+                  na_stats_row(300))
+  s1$responded <- c(1L, 1L, 0L)
+  out1 <- file.path(tmp, "out1")
+  now <- as.POSIXct("2026-06-11 04:10:00", tz = "UTC")
+  run_update(fake_io(pub, names, idmap, s1, now), out1, cran_floor = 1L, bioc_floor = 0L)
+
+  for (f in c("autoobs-downloads-recent.db", "autoobs-downloads-summary.db")) {
+    con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out1, f))
+    r <- DBI::dbGetQuery(con, "SELECT * FROM autoobs_runs")
+    DBI::dbDisconnect(con)
+    expect_equal(nrow(r), 1L)
+    expect_equal(r$run_id, as.integer(as.numeric(now)))
+    expect_equal(r$run_at, "2026-06-11T04:10:00Z")
+    expect_equal(r$snapshot_date, "2026-06-11")
+    expect_equal(r$source, "run")
+    expect_equal(r$outcome, "ok")
+    expect_equal(r$names_listed, 3L)
+    expect_equal(r$ids_cached, 0L)
+    expect_equal(r$ids_new, 3L)
+    expect_equal(r$stats_requested, 3L)
+    expect_equal(r$stats_responded, 2L)
+    expect_equal(r$stats_non_na, 2L)             # the all-NA row is dropped
+    expect_equal(c(r$pos_today, r$pos_1d, r$pos_7d, r$pos_30d, r$pos_total), c(1L, 1L, 2L, 2L, 1L))
+    expect_equal(c(r$sum_1d, r$sum_7d, r$sum_30d), c(10L, 75L, 320L))
+    expect_equal(r$day_aggregated, 1L)
+    expect_equal(r$window_end, "2026-06-10")
+    expect_equal(r$in_scope, 2L)
+    expect_equal(r$counters_prior, "none")
+    expect_equal(r$counters_published, 1L)
+  }
+  man <- jsonlite::fromJSON(file.path(out1, "manifest.json"), simplifyVector = FALSE)
+  expect_equal(man$tables$autoobs_runs, 1L)       # the integrity core sees the new table
+})
+
+test_that("run rows accumulate across ok, heartbeat and ok runs", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  names <- "R-Rcpp"; idmap <- c("R-Rcpp" = 100L)
+  run_update(fake_io(pub, names, idmap, stats_row(100, 10, 70, 300, 1000),
+                     as.POSIXct("2026-06-11 04:00:00", tz = "UTC")), file.path(tmp, "o1"),
+             cran_floor = 1L, bioc_floor = 0L)
+  publish(file.path(tmp, "o1"), pub)
+  run_update(fake_io(pub, names, idmap, NULL, as.POSIXct("2026-06-12 04:00:00", tz = "UTC"),
+                     stats_ok = FALSE), file.path(tmp, "o2"), cran_floor = 1L, bioc_floor = 0L)
+  publish(file.path(tmp, "o2"), pub)
+  run_update(fake_io(pub, names, idmap, stats_row(100, 0, 60, 290, 1000),
+                     as.POSIXct("2026-06-13 04:00:00", tz = "UTC")), file.path(tmp, "o3"),
+             cran_floor = 1L, bioc_floor = 0L)
+  for (f in c("autoobs-downloads-recent.db", "autoobs-downloads-summary.db")) {
+    con <- DBI::dbConnect(RSQLite::SQLite(), file.path(tmp, "o3", f))
+    r <- DBI::dbGetQuery(con, "SELECT snapshot_date, outcome, day_aggregated, window_end
+                                 FROM autoobs_runs ORDER BY run_id")
+    DBI::dbDisconnect(con)
+    expect_equal(r$snapshot_date, c("2026-06-11", "2026-06-12", "2026-06-13"))
+    expect_equal(r$outcome, c("ok", "heartbeat", "ok"))
+    expect_equal(r$day_aggregated, c(1L, NA, 0L))
+    expect_equal(r$window_end, c("2026-06-10", NA, "2026-06-11"))   # S-2 when not aggregated
+  }
+})
+
+test_that("counters append across runs and keep only the last 40 days", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  names <- c("R-Rcpp", "R-notacran"); idmap <- c("R-Rcpp" = 100L, "R-notacran" = 300L)
+  day1 <- as.POSIXct("2026-06-01 04:00:00", tz = "UTC")
+  for (i in 0:40) {
+    out <- file.path(tmp, sprintf("o%02d", i))
+    run_update(fake_io(pub, names, idmap,
+                       day_stats(stats_row(100, 10 + i, 70, 300, 0), stats_row(300, 1, 2, 3, 0)),
+                       day1 + i * 86400, cran = "Rcpp"), out, cran_floor = 1L, bioc_floor = 0L)
+    if (i == 0) {
+      man <- jsonlite::fromJSON(file.path(out, "manifest.json"), simplifyVector = FALSE)
+      expect_equal(man$counters$prior, "none")
+    }
+    publish(out, pub)
+  }
+  man <- jsonlite::fromJSON(file.path(out, "manifest.json"), simplifyVector = FALSE)
+  expect_true(man$counters$published)
+  expect_equal(man$counters$prior, "loaded")
+  expect_equal(man$counters$runs, 40L)
+  expect_equal(man$counters$first_run, "2026-06-02T04:00:00Z")   # 06-01 fell out on 07-11
+  expect_null(man$shards[[COUNTERS_ASSET]])                        # never under shards
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, COUNTERS_ASSET))
+  on.exit(DBI::dbDisconnect(con))
+  expect_equal(DBI::dbGetQuery(con, "SELECT COUNT(*) n FROM autoobs_counters")$n, 80L)
+  last <- DBI::dbGetQuery(con, "SELECT package, cnt_1d FROM autoobs_counters
+                                 WHERE run_id = (SELECT MAX(run_id) FROM autoobs_counters)
+                                 ORDER BY package")
+  expect_equal(last$package, c("R-Rcpp", "R-notacran"))           # out-of-scope rows kept
+  expect_equal(last$cnt_1d, c(50L, 1L))
+})
+
+test_that("a failed or unreadable counters download never stops the run", {
+  for (mode in c("fail", "garbage")) {
+    tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+    names <- "R-Rcpp"; idmap <- c("R-Rcpp" = 100L)
+    run_update(fake_io(pub, names, idmap, stats_row(100, 10, 70, 300, 0),
+                       as.POSIXct("2026-06-11 04:00:00", tz = "UTC")), file.path(tmp, "o1"),
+               cran_floor = 1L, bioc_floor = 0L)
+    publish(file.path(tmp, "o1"), pub)
+    if (mode == "garbage") writeLines("not a database", file.path(pub, COUNTERS_ASSET))
+    io <- fake_io(pub, names, idmap, stats_row(100, 12, 80, 320, 0),
+                  as.POSIXct("2026-06-12 04:00:00", tz = "UTC"))
+    if (mode == "fail") {
+      base_dl <- io$release_download
+      io$release_download <- function(pattern, dir) if (pattern == COUNTERS_ASSET) 1L else base_dl(pattern, dir)
+    }
+    out2 <- file.path(tmp, "o2")
+    res <- run_update(io, out2, cran_floor = 1L, bioc_floor = 0L)
+    expect_true("autoobs-downloads-2026.db" %in% res$changed_shards)   # the day still lands
+    expect_false(file.exists(file.path(out2, COUNTERS_ASSET)))         # nothing to upload
+    man <- jsonlite::fromJSON(file.path(out2, "manifest.json"), simplifyVector = FALSE)
+    expect_false(man$counters$published)
+    expect_equal(man$counters$prior, "download_failed")
+    expect_equal(man$counters$runs, 1L)                                # still describes the prior window
+    con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out2, "autoobs-downloads-recent.db"))
+    r <- DBI::dbGetQuery(con, "SELECT counters_prior, counters_published FROM autoobs_runs ORDER BY run_id")
+    d <- DBI::dbGetQuery(con, "SELECT date, count FROM autoobs_downloads_daily ORDER BY date")
+    DBI::dbDisconnect(con)
+    expect_equal(r$counters_prior, c("none", "download_failed"))
+    expect_equal(r$counters_published, c(1L, 0L))
+    expect_equal(d$count, c(10L, 12L))
+  }
+})
+
+test_that("a listed counters asset missing from the release starts a new window", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  names <- "R-Rcpp"; idmap <- c("R-Rcpp" = 100L)
+  run_update(fake_io(pub, names, idmap, stats_row(100, 10, 70, 300, 0),
+                     as.POSIXct("2026-06-11 04:00:00", tz = "UTC")), file.path(tmp, "o1"),
+             cran_floor = 1L, bioc_floor = 0L)
+  publish(file.path(tmp, "o1"), pub)
+  unlink(file.path(pub, COUNTERS_ASSET))       # a clobber upload that deleted and then failed
+
+  out2 <- file.path(tmp, "o2")
+  run_update(fake_io(pub, names, idmap, stats_row(100, 12, 80, 320, 0),
+                     as.POSIXct("2026-06-12 04:00:00", tz = "UTC")), out2,
+             cran_floor = 1L, bioc_floor = 0L)
+  man <- jsonlite::fromJSON(file.path(out2, "manifest.json"), simplifyVector = FALSE)
+  expect_true(man$counters$published)
+  expect_equal(man$counters$prior, "none")
+  expect_equal(man$counters$runs, 1L)
+
+  out3 <- file.path(tmp, "o3")                 # listing itself fails: hold the upload
+  run_update(fake_io(pub, names, idmap, stats_row(100, 12, 80, 320, 0),
+                     as.POSIXct("2026-06-12 04:00:00", tz = "UTC"), assets_ok = FALSE), out3,
+             cran_floor = 1L, bioc_floor = 0L)
+  man3 <- jsonlite::fromJSON(file.path(out3, "manifest.json"), simplifyVector = FALSE)
+  expect_false(man3$counters$published)
+  expect_equal(man3$counters$prior, "download_failed")
+})
+
+test_that("runs on a release made before the run record start the record", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  names <- "R-Rcpp"; idmap <- c("R-Rcpp" = 100L)
+  run_update(fake_io(pub, names, idmap, stats_row(100, 10, 70, 300, 0),
+                     as.POSIXct("2026-06-11 04:00:00", tz = "UTC")), file.path(tmp, "o1"),
+             cran_floor = 1L, bioc_floor = 0L)
+  publish(file.path(tmp, "o1"), pub)
+  # Make the published release look like one from before this change.
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(pub, "autoobs-downloads-recent.db"))
+  DBI::dbExecute(con, "DROP TABLE autoobs_runs")
+  DBI::dbDisconnect(con)
+  man <- jsonlite::fromJSON(file.path(pub, "manifest.json"), simplifyVector = FALSE)
+  man$counters <- NULL
+  write_manifest(file.path(pub, "manifest.json"), man)
+  unlink(file.path(pub, COUNTERS_ASSET))
+
+  res <- run_update(fake_io(pub, names, idmap, NULL, as.POSIXct("2026-06-12 04:00:00", tz = "UTC"),
+                            stats_ok = FALSE), file.path(tmp, "o2"), cran_floor = 1L, bioc_floor = 0L)
+  expect_equal(res$changed_shards, "autoobs-downloads-recent.db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(tmp, "o2", "autoobs-downloads-recent.db"))
+  r <- DBI::dbGetQuery(con, "SELECT outcome, reason FROM autoobs_runs")
+  DBI::dbDisconnect(con)
+  expect_equal(r$outcome, "heartbeat")
+
+  run_update(fake_io(pub, names, idmap, stats_row(100, 12, 80, 320, 0),
+                     as.POSIXct("2026-06-12 04:00:00", tz = "UTC")), file.path(tmp, "o3"),
+             cran_floor = 1L, bioc_floor = 0L)
+  man3 <- jsonlite::fromJSON(file.path(tmp, "o3", "manifest.json"), simplifyVector = FALSE)
+  expect_equal(man3$counters$prior, "none")
+  expect_true(man3$counters$published)
 })
