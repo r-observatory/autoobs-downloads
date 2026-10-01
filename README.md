@@ -7,8 +7,8 @@ Daily per-package download statistics for [autoCRAN](https://build.opensuse.org/
 >
 > - **Counts are keyed by package name across all of openSUSE, not scoped to autoCRAN.** MirrorCache aggregates downloads by RPM package name over every repository that serves that name. For the long tail of CRAN packages that exist only in autoCRAN (the large majority), the figure is effectively autoCRAN-only. For a package also shipped in the openSUSE distribution or another devel repo (for example a base or recommended R package), the figure is a superset that includes those other repositories. The `autocran_only` column marks which is which: roughly 98% of packages are autoCRAN-only and their counts are exact, while the roughly 2% that are shared are the popular base and recommended packages whose counts are supersets. Use `WHERE autocran_only = 1` when you need exact autoCRAN figures.
 > - **The daily series is built by this pipeline.** MirrorCache does not expose a historical time series, only rolling counters. Each run reads `cnt_1d` (the trailing-day count) and stores it as the count for the UTC day that just ended. The per-day series in `autoobs_downloads_daily` therefore begins on this pipeline's first run.
-> - **The summary windows come from MirrorCache directly.** `total_7d`, `total_30d`, and `cnt_total` in `autoobs_downloads_summary` are MirrorCache's own rolling counters as of the latest snapshot, so the summary is meaningful from the first run (MirrorCache began per-package tracking around 2025-12-31). `trend` is computed from this pipeline's accumulated daily series and is therefore `NULL` until roughly 60 days of history exist.
-> - **`cnt_total` is unreliable for recently added packages.** For packages MirrorCache started tracking recently, the all-time `cnt_total` is often smaller than `total_30d`. Prefer the rolling windows.
+> - **The summary windows come from MirrorCache directly.** `total_7d`, `total_30d`, and `cnt_total` in `autoobs_downloads_summary` are MirrorCache's own rolling counters as of the latest snapshot, so the summary is meaningful from the first run. `trend` is computed from this pipeline's accumulated daily series and is therefore `NULL` until roughly 60 days of history exist.
+> - **`cnt_total` is not a lifetime count.** It is MirrorCache's retained total: the sum of the rows MirrorCache keeps at the package's newest "total" timestamp. On 2026-09-30 it was 0 for 24,918 of 28,832 packages and often smaller than `total_30d`. Prefer the rolling windows.
 > - **Counts include mirror and bot traffic.** Downloads are redirect events at the openSUSE download host and include mirrors, CI systems, containers, and crawlers. Treat the figures as relative popularity and trend signals, not as distinct human installs.
 > - **Not comparable to `cran-downloads`, `r2u-downloads`, or `bioconductor-downloads`.** Different platforms, populations, and counting methods. Do not compare magnitudes across datasets.
 
@@ -93,9 +93,19 @@ gh release download current \
   --pattern "autoobs-downloads-summary.db"
 ```
 
+### Raw counters (last 40 days)
+
+`autoobs-counters-recent.db` holds every run's five MirrorCache counters for every package that returned numbers, in scope or not, for the last 40 days. Join it to `autoobs_runs` (in the recent and summary shards) on `run_id` for each run's date and state.
+
+```bash
+gh release download current \
+  --repo r-observatory/autoobs-downloads \
+  --pattern "autoobs-counters-recent.db"
+```
+
 ### Manifest
 
-`manifest.json` lists which shards changed in the most recent run, the source kind (`mirrorcache` for a live read, `frozen` for a heartbeat when the source was unreachable), per-shard coverage, and freshness timestamps.
+`manifest.json` lists which shards changed in the most recent run, the source kind (`mirrorcache` for a live read, `frozen` for a heartbeat when the source was unreachable), per-shard coverage, and freshness timestamps. The `counters` key describes the raw counters asset: its name, whether this run uploaded it (`published`), what the run found before it (`prior`: `loaded`, `none` or `download_failed`), and the rows, runs and first and last run it holds. The counters asset is never listed under `shards`.
 
 ```bash
 gh release download current \
@@ -169,13 +179,13 @@ Per-package standing, rebuilt each run. The window counts are MirrorCache's own 
 | `total_1d` | INTEGER | MirrorCache `cnt_1d`, the latest trailing-day count |
 | `total_7d` | INTEGER | MirrorCache `cnt_7d`, rolling 7-day downloads |
 | `total_30d` | INTEGER | MirrorCache `cnt_30d`, rolling 30-day downloads |
-| `cnt_total` | INTEGER | MirrorCache `cnt_total`, all-time (unreliable for recently added packages) |
+| `cnt_total` | INTEGER | MirrorCache `cnt_total`, its retained total. Not a lifetime count: 0 for most packages |
 | `avg_daily_30d` | REAL | `total_30d` divided by 30 |
 | `rank_30d` | INTEGER | Rank by `total_30d` |
 | `rank_total` | INTEGER | Rank by `cnt_total` |
 | `trend` | REAL | Percent change: last 30 days vs prior 30 of the local daily series; `NULL` until enough history |
 | `autocran_only` | INTEGER | `1` if every openSUSE location of this name is under autoCRAN (count is exact); `0` if also served elsewhere (count is a superset); `NULL` if not yet classified |
-| `first_seen` | TEXT | Date MirrorCache began tracking the package (`YYYY-MM-DD`) |
+| `first_seen` | TEXT | Oldest day MirrorCache still keeps for the package (`YYYY-MM-DD`). This is MirrorCache's retention edge, not the day it began counting the package |
 | `last_snapshot` | TEXT | UTC date of the run that produced this row |
 
 ### `autoobs_packages`
@@ -188,9 +198,46 @@ The package-name to MirrorCache-id cache, carried inside `autoobs-downloads-rece
 | `id` | INTEGER | MirrorCache numeric package id |
 | `autocran_only` | INTEGER | `1` if served only by autoCRAN, `0` if also served elsewhere, `NULL` if not yet classified |
 
+### `autoobs_runs`
+
+One row per run, heartbeats included, so every gap in the daily series has a row that explains it. The full table is in `autoobs-downloads-recent.db` and `autoobs-downloads-summary.db`.
+
+| Column | Type | Description |
+|---|---|---|
+| `run_id` | INTEGER | Run start in epoch seconds (PK) |
+| `run_at` | TEXT | Run start, ISO 8601 UTC |
+| `snapshot_date` | TEXT | UTC date of the run (S) |
+| `source` | TEXT | `run` for a pipeline run |
+| `outcome` | TEXT | `ok`, or `heartbeat` when nothing was collected |
+| `reason` | TEXT | Why a heartbeat happened |
+| `repos_listed` | INTEGER | autoCRAN repositories whose `primary.xml` was read |
+| `names_listed` | INTEGER | Package names enumerated (0 when enumeration failed and the cached set was used) |
+| `ids_cached` | INTEGER | Names already mapped to MirrorCache ids |
+| `ids_new` | INTEGER | Names newly resolved this run |
+| `stats_requested` | INTEGER | Packages whose counters were requested |
+| `stats_responded` | INTEGER | Requests that returned a body |
+| `stats_non_na` | INTEGER | Packages kept after dropping all-NA answers |
+| `pos_today`, `pos_1d`, `pos_7d`, `pos_30d`, `pos_total` | INTEGER | Packages with a positive value of each counter |
+| `sum_1d`, `sum_7d`, `sum_30d` | INTEGER | Sums of those counters |
+| `day_aggregated` | INTEGER | `1` when any `cnt_1d` was positive, meaning MirrorCache had counted day S-1 |
+| `window_end` | TEXT | Last day inside the run's windows: S-1 when aggregated, else S-2 |
+| `in_scope` | INTEGER | Rows in the summary |
+| `counters_prior` | TEXT | `loaded`, `none` or `download_failed` |
+| `counters_published` | INTEGER | `1` when this run's counters went into the counters asset |
+
+### `autoobs_counters`
+
+In `autoobs-counters-recent.db`. One row per run and package, for runs in the last 40 days.
+
+| Column | Type | Description |
+|---|---|---|
+| `run_id` | INTEGER | `autoobs_runs.run_id` (PK part 1) |
+| `package` | TEXT | RPM package name, as in `autoobs_downloads_daily` (PK part 2) |
+| `cnt_today`, `cnt_1d`, `cnt_7d`, `cnt_30d`, `cnt_total` | INTEGER | MirrorCache's counters as that run read them |
+
 ## How it works
 
-A daily GitHub Actions job (04:00 UTC) enumerates the autoCRAN package names from each openSUSE repository's rpm-md `primary.xml.gz`, resolves any newly seen names to MirrorCache ids (reusing the cached map for the rest), and fetches each package's `stat_download` counters concurrently with a small connection pool to stay polite on the volunteer-run download host. It also classifies each package as autoCRAN-only or shared by reading its `package_locations` (every newly seen name each run, and the full set at most once a week, since repository membership changes slowly). The trailing-day count for every package is appended to the history pulled from the `current` release, the affected year shard plus the rolling `autoobs-downloads-recent.db` and `autoobs-downloads-summary.db` are rebuilt, and only the changed shards are uploaded (with `manifest.json` last, so a crash leaves the prior state authoritative). When MirrorCache is unreachable the run is a cheap heartbeat that refreshes `last_checked` and leaves the prior release intact.
+A daily GitHub Actions job (04:00 UTC) enumerates the autoCRAN package names from each openSUSE repository's rpm-md `primary.xml.gz`, resolves any newly seen names to MirrorCache ids (reusing the cached map for the rest), and fetches each package's `stat_download` counters concurrently with a small connection pool to stay polite on the volunteer-run download host. It also classifies each package as autoCRAN-only or shared by reading its `package_locations` (every newly seen name each run, and the full set at most once a week, since repository membership changes slowly). The trailing-day count for every package is appended to the history pulled from the `current` release, the affected year shard plus the rolling `autoobs-downloads-recent.db` and `autoobs-downloads-summary.db` are rebuilt, and only the changed shards are uploaded (with `manifest.json` last, so a crash leaves the prior state authoritative). Every run also adds its row to `autoobs_runs` and its raw counters to `autoobs-counters-recent.db`, dropping runs older than 40 days. That asset is not the durable record, so when it cannot be downloaded the run carries on, records `download_failed`, and leaves the asset on the release as it was. When MirrorCache is unreachable the run is a heartbeat: it adds its row to `autoobs_runs` in the recent shard, uploads that shard, and leaves the daily series and summary as they were.
 
 ## Attribution
 
