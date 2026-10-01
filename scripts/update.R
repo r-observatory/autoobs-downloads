@@ -5,10 +5,11 @@
 # resolves any new names to MirrorCache ids (cached across runs), fetches the
 # current per-package download windows from MirrorCache, records the trailing-day
 # count (cnt_1d) as one point in the per-day series, and re-exports the affected
-# year shard plus the recent and summary shards. Each run adds a row to
-# autoobs_runs and its raw counters to the rolling counters asset. When
-# MirrorCache is unreachable the run is a heartbeat: it records its row in the
-# recent shard and leaves the series and summary as they were.
+# year shard plus the recent and summary shards. An ok run adds a row to
+# autoobs_runs and, unless the prior counters asset failed to download, its raw
+# counters to that asset. When MirrorCache is unreachable the run is a
+# heartbeat: it records its row in the recent shard and leaves the series and
+# summary as they were.
 # run_update(io, out_dir) takes an injectable io for offline testing.
 
 options(timeout = 600)

@@ -95,7 +95,7 @@ gh release download current \
 
 ### Raw counters (last 40 days)
 
-`autoobs-counters-recent.db` holds every run's five MirrorCache counters for every package that returned numbers, in scope or not, for the last 40 days. Join it to `autoobs_runs` (in the recent and summary shards) on `run_id` for each run's date and state.
+`autoobs-counters-recent.db` holds the five MirrorCache counters that ok runs read, for every package that returned numbers, in scope or not, over the last 40 days. A heartbeat has no counters to add, and a run that records `download_failed` adds none. Join it to `autoobs_runs` (in the recent and summary shards) on `run_id` for each run's date and state.
 
 ```bash
 gh release download current \
