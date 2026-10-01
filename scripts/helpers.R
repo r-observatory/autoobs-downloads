@@ -549,6 +549,7 @@ write_release_notes <- function(path, manifest) {
     sprintf("| **autoCRAN-only (exact counts)** | %s of %s |",
             big(manifest$summary$autocran_only), big(manifest$summary$packages)),
     sprintf("| **Changed this run** | %s |", changed),
+    sprintf("| **Counters asset** | %s |", counters_note(manifest$counters)),
     "",
     "> The remaining packages share an RPM name with the openSUSE distribution or another devel repo, so MirrorCache's count for them is not exclusive to autoCRAN. Filter `WHERE autocran_only = 1` (or sum only those rows) for autoCRAN-only totals.",
     "",
