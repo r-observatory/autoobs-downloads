@@ -12,6 +12,10 @@ on:
         description: "Re-export every year shard from the full history (after a code change to the aggregation)."
         type: boolean
         default: false
+      refill:
+        description: "Also rebuild past days from autoobs-counters-import.db on the release."
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -47,6 +51,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AUTOOBS_FORCE_REBUILD: ${{ inputs.force_full_rebuild }}
+          AUTOOBS_REFILL: ${{ inputs.refill }}
         run: |
           mkdir -p out
           Rscript scripts/update.R out/

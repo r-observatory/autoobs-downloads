@@ -10,3 +10,9 @@ test_that("the counters asset uploads only when published, before the shards and
   expect_length(guard, 1L); expect_length(counters, 1L)
   expect_true(guard < counters && counters < shards && shards < manifest)
 })
+
+test_that("the refill input reaches the update script", {
+  wf <- .wf()
+  expect_true(any(grepl("^      refill:$", wf)))
+  expect_true(any(grepl("AUTOOBS_REFILL: ${{ inputs.refill }}", wf, fixed = TRUE)))
+})
