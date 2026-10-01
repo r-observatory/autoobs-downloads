@@ -821,3 +821,17 @@ test_that("a MirrorCache more than a week behind never has a day recorded as unc
   expect_false(anyNA(m$count.x))
   expect_equal(m$count.x, m$count.y)                 # every stored value is the truth
 })
+
+test_that("an unaggregated run leaves total_1d NULL and the summary has no rank_total", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  ids <- c("R-a" = 1L, "R-b" = 2L)
+  truth <- fill_truth("2026-06-01")
+  dates <- format(seq(as.Date("2026-06-02"), as.Date("2026-06-10"), by = "day"))
+  r <- run_days(pub, tmp, truth, ids, dates, unaggregated = "2026-06-10")
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(r$out, "autoobs-downloads-summary.db"))
+  on.exit(DBI::dbDisconnect(con))
+  s <- DBI::dbGetQuery(con, "SELECT total_1d, total_7d FROM autoobs_downloads_summary")
+  expect_true(all(is.na(s$total_1d)))
+  expect_true(all(s$total_7d > 0))
+  expect_false("rank_total" %in% DBI::dbListFields(con, "autoobs_downloads_summary"))
+})

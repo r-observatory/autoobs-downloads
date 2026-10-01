@@ -171,7 +171,6 @@ summary_table_ddl <- function(table) {
       cnt_total      INTEGER,
       avg_daily_30d  REAL,
       rank_30d       INTEGER,
-      rank_total     INTEGER,
       trend          REAL,
       autocran_only  INTEGER,
       first_seen     TEXT,
@@ -181,7 +180,7 @@ summary_table_ddl <- function(table) {
 
 SUMMARY_COLS <- c("package", "package_lower", "origin", "canonical_name", "identity_state",
                   "id", "total_1d", "total_7d", "total_30d",
-                  "cnt_total", "avg_daily_30d", "rank_30d", "rank_total", "trend",
+                  "cnt_total", "avg_daily_30d", "rank_30d", "trend",
                   "autocran_only", "first_seen", "last_snapshot")
 
 empty_summary <- function() {
@@ -198,16 +197,16 @@ empty_summary <- function() {
 # series). `trend` compares the last 30 days of the locally-accumulated daily
 # series to the prior 30, so it is NULL until ~60 days of history exist. The
 # summary is promote-only: origin='other' rows (not a known CRAN/Bioc package) are
-# dropped before ranking, so rank_30d/rank_total are dense over the in-scope
-# survivors only.
+# dropped before ranking, so rank_30d is dense over the in-scope survivors only.
+# total_1d is NULL until MirrorCache has counted the day before the snapshot.
 build_summary <- function(daily_con, stats_df, anchor_date, snapshot_date,
-                          identity_df = NULL, autocran_map = NULL) {
+                          identity_df = NULL, autocran_map = NULL, day_aggregated = TRUE) {
   if (nrow(stats_df) == 0) return(empty_summary())
   base <- data.frame(
     package       = stats_df$package,
     package_lower = tolower(stats_df$package),
     id            = as.integer(stats_df$id),
-    total_1d      = as.integer(stats_df$cnt_1d),
+    total_1d      = if (isTRUE(day_aggregated)) as.integer(stats_df$cnt_1d) else NA_integer_,
     total_7d      = as.integer(stats_df$cnt_7d),
     total_30d     = as.integer(stats_df$cnt_30d),
     cnt_total     = as.integer(stats_df$cnt_total),
@@ -250,7 +249,6 @@ build_summary <- function(daily_con, stats_df, anchor_date, snapshot_date,
   if (nrow(m) == 0) return(empty_summary())
 
   m$rank_30d   <- as.integer(rank(-ifelse(is.na(m$total_30d), 0L, m$total_30d), ties.method = "min"))
-  m$rank_total <- as.integer(rank(-ifelse(is.na(m$cnt_total), 0L, m$cnt_total), ties.method = "min"))
   m$autocran_only <- if (is.null(autocran_map) || nrow(autocran_map) == 0) NA_integer_
     else as.integer(autocran_map$autocran_only[match(m$package, autocran_map$package)])
   m <- m[order(m$rank_30d, m$package), , drop = FALSE]

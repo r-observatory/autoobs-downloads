@@ -346,7 +346,8 @@ run_update <- function(io, out_dir, force_full = FALSE,
     DBI::dbExecute(con, "CREATE TABLE autoobs_downloads_daily (package TEXT, date TEXT, count INTEGER)")
   }
   summary_df <- build_summary(con, stats_df, attribute_date, snap_str,
-                              identity_df = identity_df, autocran_map = cache)
+                              identity_df = identity_df, autocran_map = cache,
+                              day_aggregated = day_aggregated)
   rec$in_scope <- nrow(summary_df)
   rec$outcome  <- "ok"
   runs_all     <- merge_runs(runs_prev, run_row(rec))

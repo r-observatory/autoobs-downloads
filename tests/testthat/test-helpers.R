@@ -208,3 +208,19 @@ test_that("the run record carries the fill columns", {
   expect_equal(n$days_filled, 2L)
   expect_true(is.na(n$fill_rejected))
 })
+
+test_that("the summary has no rank_total and nulls total_1d before aggregation", {
+  expect_false("rank_total" %in% SUMMARY_COLS)
+  p <- tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), p); on.exit(DBI::dbDisconnect(con))
+  DBI::dbExecute(con, summary_table_ddl("t"))
+  expect_false("rank_total" %in% DBI::dbListFields(con, "t"))
+  DBI::dbExecute(con, "CREATE TABLE autoobs_downloads_daily (package TEXT, date TEXT, count INTEGER)")
+  st <- cbind(stats_row(1, cnt_1d = 0, 21, 90, 0), package = "R-a", stringsAsFactors = FALSE)
+  ident <- data.frame(package = "R-a", origin = "cran", canonical_name = "a",
+                      identity_state = "live", stringsAsFactors = FALSE)
+  s0 <- build_summary(con, st, "2026-06-10", "2026-06-11", identity_df = ident, day_aggregated = FALSE)
+  expect_true(is.na(s0$total_1d))
+  s1 <- build_summary(con, st, "2026-06-10", "2026-06-11", identity_df = ident, day_aggregated = TRUE)
+  expect_equal(s1$total_1d, 0L)
+})
