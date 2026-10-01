@@ -105,7 +105,7 @@ gh release download current \
 
 ### Manifest
 
-`manifest.json` lists which shards changed in the most recent run, the source kind (`mirrorcache` for a live read, `frozen` for a heartbeat when the source was unreachable), per-shard coverage, and freshness timestamps. The `counters` key describes the raw counters asset: its name, whether this run uploaded it (`published`), what the run found before it (`prior`: `loaded`, `none` or `download_failed`), and the rows, runs and first and last run it holds. The counters asset is never listed under `shards`.
+`manifest.json` lists which shards changed in the most recent run, the newest day the series holds (`summary.latest_date`), whether MirrorCache had counted the day before the run (`summary.day_aggregated`), the last day inside the run's windows (`summary.window_end`), the days the run filled (`summary.days_filled`), the source kind (`mirrorcache` for a live read, `frozen` for a heartbeat when the source was unreachable), per-shard coverage, and freshness timestamps. The `counters` key describes the raw counters asset: its name, whether this run uploaded it (`published`), what the run found before it (`prior`: `loaded`, `none` or `download_failed`), and the rows, runs and first and last run it holds. The counters asset is never listed under `shards`.
 
 ```bash
 gh release download current \
@@ -176,13 +176,12 @@ Per-package standing, rebuilt each run. The window counts are MirrorCache's own 
 | `package` | TEXT | RPM package name (PK) |
 | `package_lower` | TEXT | Lowercased helper column for case-insensitive joins |
 | `id` | INTEGER | MirrorCache numeric package id |
-| `total_1d` | INTEGER | MirrorCache `cnt_1d`, the latest trailing-day count |
+| `total_1d` | INTEGER | MirrorCache `cnt_1d`, the count for the day before the snapshot; `NULL` when MirrorCache had not counted that day yet |
 | `total_7d` | INTEGER | MirrorCache `cnt_7d`, rolling 7-day downloads |
 | `total_30d` | INTEGER | MirrorCache `cnt_30d`, rolling 30-day downloads |
 | `cnt_total` | INTEGER | MirrorCache `cnt_total`, its retained total. Not a lifetime count: 0 for most packages |
 | `avg_daily_30d` | REAL | `total_30d` divided by 30 |
 | `rank_30d` | INTEGER | Rank by `total_30d` |
-| `rank_total` | INTEGER | Rank by `cnt_total` |
 | `trend` | REAL | Percent change: last 30 days vs prior 30 of the local daily series; `NULL` until enough history |
 | `autocran_only` | INTEGER | `1` if every openSUSE location of this name is under autoCRAN (count is exact); `0` if also served elsewhere (count is a superset); `NULL` if not yet classified |
 | `first_seen` | TEXT | Oldest day MirrorCache still keeps for the package (`YYYY-MM-DD`). This is MirrorCache's retention edge, not the day it began counting the package |
