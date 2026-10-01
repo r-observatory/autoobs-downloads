@@ -46,3 +46,27 @@ na_stats_row <- function(id) {
       stringsAsFactors = FALSE), append = TRUE)
   }
 }
+
+# MirrorCache's counters at snapshot S from a truth frame (package, date, count):
+# cnt_1d is day S-1 once aggregated, and the windows run from S-7 and S-30 to the
+# last day MirrorCache has counted: S-1 (aggregated), S-2, or `last` when
+# MirrorCache is further behind. `ids` maps package to id, in output order.
+mc_counters <- function(truth, ids, S, aggregated = TRUE, last = NULL) {
+  S <- as.Date(S); end <- last %||% format(S - if (aggregated) 1L else 2L)
+  counted <- end == format(S - 1L)
+  tot <- function(p, from) sum(truth$count[truth$package == p & truth$date >= from & truth$date <= end])
+  do.call(rbind, lapply(names(ids), function(p) {
+    one <- if (counted) sum(truth$count[truth$package == p & truth$date == format(S - 1L)]) else 0
+    cbind(stats_row(ids[[p]], one, tot(p, format(S - 7L)), tot(p, format(S - 30L)), 0),
+          package = p, stringsAsFactors = FALSE)
+  }))
+}
+
+# A truth series for two packages; R-b has no downloads on 06-05.
+fill_truth <- function(from = "2026-05-01", to = "2026-06-10") {
+  d <- format(seq(as.Date(from), as.Date(to), by = "day"))
+  t <- rbind(data.frame(package = "R-a", date = d, count = 10L + seq_along(d) %% 5L),
+             data.frame(package = "R-b", date = d, count = 1L + seq_along(d) %% 3L))
+  t$count[t$package == "R-b" & t$date == "2026-06-05"] <- 0L
+  t
+}

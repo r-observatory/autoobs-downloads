@@ -630,3 +630,84 @@ upsert_days <- function(days, new) {
   rownames(all) <- NULL
   all
 }
+
+# One run's equations: W7 = [S-7, window_end], W30 = [S-30, window_end] and
+# W30 minus W7, each a +1 per date and the matching counter per package. A run
+# that did not see the day before it counted cannot tell whether window_end was
+# counted either (`sure_end` FALSE), so W7 and W30 carry that day as `soft`.
+# With no 7-day counts at all on such a run, W30 minus W7 carries S-8 as `soft`.
+run_equations <- function(counters, snapshot_date, window_end, method = "window",
+                          sure_end = TRUE, run_id = NA_integer_) {
+  S <- as.Date(snapshot_date); end <- as.Date(window_end)
+  w7  <- format(seq(S - 7L,  end, by = "day"))
+  w30 <- format(seq(S - 30L, end, by = "day"))
+  soft <- if (isTRUE(sure_end)) NULL else stats::setNames(as.integer(run_id), format(end))
+  eq <- function(dates, v, soft = NULL) {
+    ok <- !is.na(v)
+    list(coef = stats::setNames(rep(1, length(dates)), dates), method = method, soft = soft,
+         value = data.frame(package = counters$package[ok], value = as.numeric(v[ok]),
+                            stringsAsFactors = FALSE))
+  }
+  # With no positive cnt_7d on such a run MirrorCache may be more than a week
+  # behind, and then W30 minus W7 does not reach S-8 either.
+  soft8 <- if (isTRUE(sure_end) || any(counters$cnt_7d > 0, na.rm = TRUE)) NULL else
+    stats::setNames(as.integer(run_id), format(S - 8L))
+  list(eq(w7, counters$cnt_7d, soft), eq(w30, counters$cnt_30d, soft),
+       eq(setdiff(w30, w7), counters$cnt_30d - counters$cnt_7d, soft8))
+}
+
+# Per-package sum of coef x count over the given dates (0 where a package has no row).
+.signed_sums <- function(daily, coef, dates, packages) {
+  out <- stats::setNames(numeric(length(packages)), packages)
+  sel <- daily$date %in% dates & daily$package %in% packages
+  if (any(sel)) {
+    w <- rowsum(daily$count[sel] * unname(coef[daily$date[sel]]), daily$package[sel])
+    out[rownames(w)] <- w[, 1]
+  }
+  out
+}
+
+# Solve, one day at a time, every equation with exactly one unknown date and no
+# date before `floor`. A negative package refuses the day; a day summing to 0 is
+# 'upstream_missing' with no rows, unless it is the equation's own `soft` day,
+# which stays unknown. Fully known equations that do not add up are counted per
+# package in `residual`.
+solve_days <- function(eqs, daily, known, floor, run_id) {
+  rows <- data.frame(package = character(0), date = character(0), count = integer(0),
+                     stringsAsFactors = FALSE)
+  days <- empty_days(); refused <- character(0)
+  repeat {
+    progress <- FALSE
+    for (e in eqs) {
+      d <- names(e$coef)
+      if (any(d < floor) || nrow(e$value) == 0) next
+      unk <- setdiff(d, known)
+      if (length(unk) != 1L || unk %in% refused) next
+      u <- unk
+      ks <- .signed_sums(rbind(daily, rows), e$coef, setdiff(d, u), e$value$package)
+      cu <- (e$value$value - ks[e$value$package]) / e$coef[[u]]
+      if (any(cu < 0)) { refused <- c(refused, u); next }
+      # Zero on the run's unsure last day may only mean MirrorCache was late.
+      if (u %in% names(e$soft) && sum(cu) == 0) next
+      pos <- cu > 0
+      if (any(pos))
+        rows <- rbind(rows, data.frame(package = e$value$package[pos], date = u,
+                                       count = as.integer(cu[pos]), stringsAsFactors = FALSE))
+      days <- rbind(days, data.frame(date = u,
+        method = if (any(pos)) e$method else "upstream_missing",
+        run_id = as.integer(run_id), packages = sum(pos),
+        downloads = as.integer(sum(cu)), stringsAsFactors = FALSE))
+      known <- c(known, u); progress <- TRUE
+    }
+    if (!progress) break
+  }
+  bad <- character(0)
+  all <- rbind(daily, rows)
+  for (e in eqs) {
+    d <- names(e$coef)
+    if (any(d < floor) || !all(d %in% known) || nrow(e$value) == 0) next
+    ks <- .signed_sums(all, e$coef, d, e$value$package)
+    bad <- union(bad, e$value$package[e$value$value != ks[e$value$package]])
+  }
+  list(rows = rows, days = days, rejected = length(unique(refused)), residual = length(bad))
+}
