@@ -224,3 +224,11 @@ test_that("the summary has no rank_total and nulls total_1d before aggregation",
   s1 <- build_summary(con, st, "2026-06-10", "2026-06-11", identity_df = ident, day_aggregated = TRUE)
   expect_equal(s1$total_1d, 0L)
 })
+
+test_that("the release notes say rank_total is gone", {
+  p <- tempfile(fileext = ".md")
+  write_release_notes(p, list(summary = list(latest_date = "2026-09-29")))
+  txt <- paste(readLines(p), collapse = "\n")
+  expect_match(txt, "no longer has `rank_total`", fixed = TRUE)
+  expect_match(txt, "| **Latest day** | 2026-09-29 |", fixed = TRUE)
+})

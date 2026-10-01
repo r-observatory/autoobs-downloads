@@ -394,8 +394,11 @@ run_update <- function(io, out_dir, force_full = FALSE,
       out_of_scope     = nrow(stats_df) - nrow(summary_df),
       raw_tracked      = nrow(stats_df),
       autocran_only    = sum(summary_df$autocran_only == 1L, na.rm = TRUE),
-      latest_date      = attribute_date,
+      latest_date      = if (nrow(days_all) > 0) max(days_all$date) else NULL,
       snapshot_date    = snap_str,
+      day_aggregated   = day_aggregated,
+      window_end       = rec$window_end,
+      days_filled      = rec$days_filled,
       daily_rows_today = nrow(daily_today)))
 
   # Integrity / completeness core for the summary DB the downstream merge pulls.

@@ -554,6 +554,8 @@ write_release_notes <- function(path, manifest) {
     sprintf("| **Changed this run** | %s |", changed),
     sprintf("| **Counters asset** | %s |", counters_note(manifest$counters)),
     "",
+    "> `autoobs_downloads_summary` no longer has `rank_total`, which ranked a counter that is not a lifetime total, and `total_1d` is NULL until MirrorCache has counted the day before the snapshot. **Latest day** is the newest day the series holds.",
+    "",
     "> The remaining packages share an RPM name with the openSUSE distribution or another devel repo, so MirrorCache's count for them is not exclusive to autoCRAN. Filter `WHERE autocran_only = 1` (or sum only those rows) for autoCRAN-only totals.",
     "",
     "## Shard coverage",

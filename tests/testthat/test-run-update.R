@@ -835,3 +835,19 @@ test_that("an unaggregated run leaves total_1d NULL and the summary has no rank_
   expect_true(all(s$total_7d > 0))
   expect_false("rank_total" %in% DBI::dbListFields(con, "autoobs_downloads_summary"))
 })
+
+test_that("the manifest names the newest known day and the run's window facts", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  ids <- c("R-a" = 1L, "R-b" = 2L)
+  truth <- fill_truth("2026-06-01")
+  dates <- format(seq(as.Date("2026-06-02"), as.Date("2026-06-10"), by = "day"))
+  r <- run_days(pub, tmp, truth, ids, dates, unaggregated = "2026-06-10")
+  man <- jsonlite::fromJSON(file.path(r$out, "manifest.json"), simplifyVector = FALSE)
+  expect_equal(man$summary$latest_date, "2026-06-08")     # 06-09 is not counted yet
+  expect_equal(man$summary$snapshot_date, "2026-06-10")
+  expect_false(man$summary$day_aggregated)
+  expect_equal(man$summary$window_end, "2026-06-08")
+  expect_equal(man$summary$days_filled, 0L)
+  expect_match(paste(readLines(file.path(r$out, "release_notes.md")), collapse = "\n"),
+               "| **Latest day** | 2026-06-08 |", fixed = TRUE)
+})
