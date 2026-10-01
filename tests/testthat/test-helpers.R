@@ -115,3 +115,60 @@ test_that("build_summary returns an empty frame when nothing is in scope", {
   expect_equal(nrow(s), 0L)
   expect_setequal(names(s), SUMMARY_COLS)
 })
+
+test_that("autoobs_runs DDL, normalisation and merge agree with RUNS_SCHEMA", {
+  p <- tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), p); on.exit(DBI::dbDisconnect(con))
+  DBI::dbExecute(con, runs_table_ddl())
+  expect_equal(DBI::dbListFields(con, "autoobs_runs"), names(RUNS_SCHEMA))
+  n <- normalize_runs(data.frame(run_id = 5, outcome = "ok", stringsAsFactors = FALSE))
+  expect_equal(names(n), names(RUNS_SCHEMA))
+  expect_type(n$run_id, "integer")
+  expect_type(n$window_end, "character")
+  expect_true(is.na(n$stats_requested))
+  m <- merge_runs(data.frame(run_id = c(9L, 3L), outcome = c("ok", "ok")),
+                  data.frame(run_id = 9L, outcome = "heartbeat"))
+  expect_equal(m$run_id, c(3L, 9L))
+  expect_equal(m$outcome, c("ok", "heartbeat"))   # a repeated run_id keeps the newer row
+})
+
+test_that("counter_stats and window_end_for read aggregation from cnt_1d", {
+  s <- rbind(stats_row(1, 0, 7, 30, 0, cnt_today = 1), stats_row(2, NA, 3, 5, 9))
+  cs <- counter_stats(s)
+  expect_equal(cs$day_aggregated, 0L)
+  expect_equal(c(cs$pos_today, cs$pos_7d, cs$pos_total), c(1L, 2L, 1L))
+  expect_equal(c(cs$sum_7d, cs$sum_30d), c(10L, 35L))
+  expect_equal(window_end_for("2026-09-30", 0L), "2026-09-28")
+  expect_equal(window_end_for("2026-09-30", 1L), "2026-09-29")
+})
+
+test_that("update_counters appends, replaces a repeated run and trims old runs", {
+  p <- tempfile(fileext = ".db")
+  st <- cbind(stats_row(1, 1, 2, 3, 4), package = "R-a", stringsAsFactors = FALSE)
+  update_counters(p, counters_rows(st, 100L), keep_from = 0L, fresh = TRUE)
+  update_counters(p, counters_rows(st, 200L), keep_from = 0L)
+  r <- update_counters(p, counters_rows(rbind(st, st), 200L), keep_from = 150L)
+  expect_equal(r$rows, 1L)                     # run 100 trimmed, duplicate package dropped
+  expect_equal(r$runs, 1L)
+  expect_equal(r$first_run, 200L)
+  expect_true(counters_readable(p))
+  g <- tempfile(fileext = ".db"); writeLines("not a database", g)
+  expect_false(counters_readable(g))
+  expect_false(counters_readable(tempfile()))
+})
+
+test_that("counters_note says whether the window moved", {
+  expect_equal(counters_note(NULL), "not yet published")
+  expect_match(counters_note(list(asset = "a.db", published = TRUE, runs = 3, window_days = 40)),
+               "3 runs over the last 40 days")
+  expect_match(counters_note(list(published = FALSE, prior = "download_failed")), "could not be downloaded")
+  expect_equal(counters_note(list(published = FALSE, prior = "loaded")), "not updated this run")
+})
+
+test_that("a database without the counters table is not a readable counters asset", {
+  p <- tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), p)
+  DBI::dbExecute(con, "CREATE TABLE something_else (x INTEGER)")
+  DBI::dbDisconnect(con)
+  expect_false(counters_readable(p))
+})
