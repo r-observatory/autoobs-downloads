@@ -851,3 +851,223 @@ test_that("the manifest names the newest known day and the run's window facts", 
   expect_match(paste(readLines(file.path(r$out, "release_notes.md")), collapse = "\n"),
                "| **Latest day** | 2026-06-08 |", fixed = TRUE)
 })
+
+
+# A published series as production holds it before a refill: R-x is outside the
+# summary's scope, two days were never filled, the counters window is kept, and
+# the import asset built from the history sits on the release. The releases up
+# to 06-13 were made before the scope filter and hold R-x; the later ones do not.
+# `window_runs` keeps only that many pipeline runs in the counters window.
+refill_setup <- function(tmp, window_runs = NULL) {
+  pub <- file.path(tmp, "pub"); dir.create(pub)
+  ids <- c("R-a" = 1L, "R-b" = 2L, "R-x" = 3L)
+  truth <- with_outsider(fill_truth("2026-04-01", "2026-06-26"))
+  flat <- c("2026-06-15", "2026-06-18")
+  dates <- format(seq(as.Date("2026-06-12"), as.Date("2026-06-20"), by = "day"))
+  run_days(pub, tmp, truth, ids, dates, unaggregated = flat, cran = c("a", "b"))
+  recent <- file.path(pub, "autoobs-downloads-recent.db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), recent)
+  DBI::dbExecute(con, "DELETE FROM autoobs_downloads_daily WHERE date IN ('2026-06-14', '2026-06-17')")
+  DBI::dbExecute(con, "DELETE FROM autoobs_days WHERE date IN ('2026-06-14', '2026-06-17')")
+  DBI::dbDisconnect(con)
+  if (!is.null(window_runs)) {
+    con <- DBI::dbConnect(RSQLite::SQLite(), file.path(pub, COUNTERS_ASSET))
+    rid <- DBI::dbGetQuery(con, "SELECT DISTINCT run_id FROM autoobs_counters ORDER BY run_id")$run_id
+    DBI::dbExecute(con, "DELETE FROM autoobs_counters WHERE run_id < ?",
+                   params = list(min(utils::tail(rid, window_runs))))
+    DBI::dbDisconnect(con)
+  }
+  hist <- file.path(tmp, "history.db")
+  write_history_fixture(hist, truth, ids[c("R-a", "R-b")], dates, unaggregated = flat,
+                        wide = list(ids = ids, until = "2026-06-13"))
+  source(file.path(.ao_root, "scripts", "import_release_snapshots.R"))
+  capture.output(imp <- import_release_snapshots(hist, recent, pub, file.path(pub, COUNTERS_ASSET)))
+  list(pub = pub, ids = ids, truth = truth, preview = imp$fill)
+}
+
+# Stored values against the truth. `absent` counts truth rows the series should
+# hold and does not: every package on every held day, except R-x on a release day.
+stored_vs_truth <- function(path, truth) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), path); on.exit(DBI::dbDisconnect(con))
+  d <- DBI::dbGetQuery(con, "SELECT package, date, count FROM autoobs_downloads_daily")
+  days <- DBI::dbGetQuery(con, "SELECT date, method, packages, downloads FROM autoobs_days ORDER BY date")
+  m <- merge(d, truth, by = c("package", "date"))
+  want <- truth[truth$count > 0 & truth$date %in% days$date &
+                !(truth$package == "R-x" & truth$date %in% days$date[days$method == "release"]), ]
+  list(rows = nrow(d), matched = nrow(m), same = all(m$count.x == m$count.y), daily = d, days = days,
+       absent = nrow(want) - nrow(merge(d, want, by = c("package", "date"))),
+       runs = DBI::dbGetQuery(con, "SELECT * FROM autoobs_runs ORDER BY run_id"),
+       packages = DBI::dbGetQuery(con, "SELECT package, rebuilt FROM autoobs_packages ORDER BY package"))
+}
+
+test_that("a refill run rebuilds holes and earlier days over the packages the snapshots cover", {
+  tmp <- withr::local_tempdir()
+  fx <- refill_setup(tmp)
+  expect_true(file.exists(file.path(fx$pub, COUNTERS_ASSET)))     # the counters window is in play
+  r <- run_days(fx$pub, tmp, fx$truth, fx$ids, "2026-06-21", hour = "09:00:00", cran = c("a", "b"),
+                refill = TRUE)
+  expect_true("autoobs-downloads-2026.db" %in% r$res$changed_shards)
+  got <- stored_vs_truth(file.path(r$out, "autoobs-downloads-recent.db"), fx$truth)
+  expect_equal(got$matched, got$rows)
+  expect_true(got$same)                              # every stored or rebuilt value is the truth
+  expect_equal(got$absent, 0L)                       # and no covered package lost a row
+  rel <- got$days$date[got$days$method == "release"]
+  expect_true(all(c("2026-06-14", "2026-06-17") %in% rel))
+  expect_true(any(rel < "2026-06-11"))               # days before the series began
+  expect_false(any(got$daily$package == "R-x" & got$daily$date %in% rel))
+  expect_true(all(c("2026-06-13", "2026-06-16") %in%
+                  got$daily$date[got$daily$package == "R-x"]))   # its stored days are untouched
+  expect_true(all(fx$preview$days$date %in% rel))    # every day the preview named is filled
+  expect_equal(setdiff(rel, fx$preview$days$date), "2026-05-21")  # one more, from this run's own 30 days
+  expect_equal(got$packages$rebuilt, c(1L, 1L, 0L))  # R-a, R-b covered; R-x not
+
+  run <- got$runs[nrow(got$runs), ]
+  expect_true(any(got$runs$source == "observatory.db v2026-06-12"))
+  expect_equal(run$reason, "refill")
+  expect_equal(run$fill_rejected, 0L)
+  expect_equal(run$window_residual, 0L)
+  expect_equal(run$days_filled, length(rel))
+  man <- r$res$manifest
+  expect_equal(man$counters$import$asset, COUNTERS_IMPORT_ASSET)
+  expect_equal(man$counters$import$kept, 9L)
+  expect_equal(man$counters$import$packages, 2L)
+  expect_equal(man$counters$import$left_out, 1L)     # R-x: the early releases held it, the later ones not
+  expect_equal(man$counters$import$days_filled, length(rel))
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(r$out, "autoobs-downloads-2026.db"))
+  on.exit(DBI::dbDisconnect(con))
+  expect_setequal(DBI::dbGetQuery(con, "SELECT date FROM autoobs_days WHERE method = 'release'")$date, rel)
+})
+
+test_that("a later run does not read a release day as zero for a package the refill left out", {
+  tmp <- withr::local_tempdir()
+  fx <- refill_setup(tmp)
+  run_days(fx$pub, tmp, fx$truth, fx$ids, "2026-06-21", hour = "09:00:00", cran = c("a", "b"),
+           refill = TRUE)
+  # 06-22 is missed and filled by the 06-24 run, whose 7 days hold the release day 06-17.
+  r <- run_days(fx$pub, tmp, fx$truth, fx$ids, c("2026-06-22", "2026-06-23", "2026-06-24"),
+                unaggregated = "2026-06-23", cran = c("a", "b"))
+  got <- stored_vs_truth(file.path(r$out, "autoobs-downloads-recent.db"), fx$truth)
+  expect_true(got$same)                              # R-x did not take 06-17's downloads
+  expect_equal(got$absent, 0L)
+  expect_equal(got$days$method[got$days$date == "2026-06-22"], "release")
+  expect_setequal(got$daily$package[got$daily$date == "2026-06-22"], c("R-a", "R-b"))
+  later <- got$runs[got$runs$snapshot_date >= "2026-06-22", ]
+  expect_equal(later$window_residual, c(0L, 0L, 0L)) # R-x is not checked against release days
+  expect_equal(later$fill_rejected, c(0L, 0L, 0L))
+  expect_equal(later$days_filled, c(0L, 0L, 1L))
+  expect_equal(got$packages$rebuilt, c(1L, 1L, 0L))  # carried by ordinary runs
+})
+
+test_that("a package only the early releases held is left out with one pipeline run to check against", {
+  tmp <- withr::local_tempdir()
+  fx <- refill_setup(tmp, window_runs = 1L)
+  expect_setequal(fx$preview$covered, c("R-a", "R-b"))
+  expect_equal(fx$preview$left_out$package, "R-x")
+  run_days(fx$pub, tmp, fx$truth, fx$ids, "2026-06-21", hour = "09:00:00", cran = c("a", "b"),
+           refill = TRUE)
+  # 06-22 is missed and filled by the 06-24 run, whose 7 days hold the release day 06-17.
+  r <- run_days(fx$pub, tmp, fx$truth, fx$ids, c("2026-06-22", "2026-06-23", "2026-06-24"),
+                unaggregated = "2026-06-23", cran = c("a", "b"))
+  got <- stored_vs_truth(file.path(r$out, "autoobs-downloads-recent.db"), fx$truth)
+  expect_true(got$same)                              # R-x on 06-22 is not 06-17 and 06-22 together
+  expect_equal(got$absent, 0L)
+  rel <- got$days$date[got$days$method == "release"]
+  expect_true(all(c("2026-06-14", "2026-06-17", "2026-06-22") %in% rel))
+  expect_false(any(got$daily$package == "R-x" & got$daily$date %in% rel))
+  expect_equal(got$packages$rebuilt, c(1L, 1L, 0L))
+  refill <- got$runs[got$runs$reason %in% "refill", ]
+  expect_equal(refill$fill_rejected, 0L)
+  later <- got$runs[got$runs$snapshot_date >= "2026-06-22", ]
+  expect_equal(later$window_residual, c(0L, 0L, 0L))
+  expect_equal(later$days_filled, c(0L, 0L, 1L))
+})
+
+test_that("the refill reproduces the online fill on the same run log", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  ids <- c("R-a" = 1L, "R-b" = 2L)
+  truth <- fill_truth("2026-05-01", "2026-06-12")
+  dates <- format(seq(as.Date("2026-06-02"), as.Date("2026-06-11"), by = "day"))
+  r <- run_days(pub, tmp, truth, ids, dates, unaggregated = "2026-06-10")
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(r$out, "autoobs-downloads-recent.db"))
+  online <- DBI::dbGetQuery(con, "SELECT package, count FROM autoobs_downloads_daily
+                                   WHERE date = '2026-06-09' ORDER BY package")
+  daily <- DBI::dbGetQuery(con, "SELECT package, date, count FROM autoobs_downloads_daily
+                                  WHERE date <> '2026-06-09'")
+  days <- DBI::dbGetQuery(con, "SELECT * FROM autoobs_days WHERE date <> '2026-06-09'")
+  DBI::dbDisconnect(con)
+  hist <- file.path(tmp, "history.db")
+  write_history_fixture(hist, truth, ids, dates, unaggregated = "2026-06-10")
+  h <- DBI::dbConnect(RSQLite::SQLite(), hist)
+  sr <- snapshot_runs(history_autoobs_snapshots(h))
+  DBI::dbDisconnect(h)
+  rf <- refill_solve(normalize_runs(data.frame()), empty_counters(), sr$runs, sr$counters,
+                     daily, days, run_id = 0L)
+  got <- rf$rows[rf$rows$date == "2026-06-09", ]
+  got <- got[order(got$package), ]
+  expect_equal(got$package, online$package)
+  expect_equal(got$count, online$count)
+})
+
+test_that("a refill without the import asset stops before collecting anything", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  names <- "R-a"; idmap <- c("R-a" = 1L)
+  run_update(fake_io(pub, names, idmap, stats_row(1, 10, 70, 300, 0),
+                     as.POSIXct("2026-06-11 04:00:00", tz = "UTC")), file.path(tmp, "o1"),
+             cran_floor = 1L, bioc_floor = 0L)
+  publish(file.path(tmp, "o1"), pub)
+  log <- new.env()
+  io <- fake_io(pub, names, idmap, stats_row(1, 12, 80, 310, 0), as.POSIXct("2026-06-12 04:00:00", tz = "UTC"))
+  base_fetch <- io$fetch_stats
+  io$fetch_stats <- function(ids) { log$fetched <- TRUE; base_fetch(ids) }
+  out2 <- file.path(tmp, "o2")
+  expect_error(run_update(io, out2, cran_floor = 1L, bioc_floor = 0L, refill = TRUE),
+               "refill needs autoobs-counters-import.db")
+  expect_null(log$fetched)
+  expect_false(file.exists(file.path(out2, "autoobs-downloads-summary.db")))
+})
+
+test_that("running the refill twice leaves the same series", {
+  tmp <- withr::local_tempdir()
+  fx <- refill_setup(tmp)
+  series <- function(out) {
+    got <- stored_vs_truth(file.path(out, "autoobs-downloads-recent.db"), fx$truth)
+    daily <- got$daily[order(got$daily$package, got$daily$date), ]
+    rownames(daily) <- NULL
+    list(daily = daily, days = got$days, packages = got$packages)
+  }
+  once <- run_days(fx$pub, tmp, fx$truth, fx$ids, "2026-06-21", hour = "09:00:00", cran = c("a", "b"),
+                   refill = TRUE)
+  twice <- run_days(fx$pub, tmp, fx$truth, fx$ids, "2026-06-21", hour = "11:00:00", cran = c("a", "b"),
+                    refill = TRUE)
+  a <- series(once$out); b <- series(twice$out)
+  expect_equal(b$daily, a$daily)
+  expect_equal(b$days, a$days)
+  expect_equal(b$packages, a$packages)
+  expect_equal(twice$res$manifest$counters$import$days_filled, 0L)   # nothing left to rebuild
+  expect_equal(twice$res$manifest$counters$import$packages, 2L)
+  expect_equal(twice$res$manifest$counters$import$left_out, 1L)
+})
+
+test_that("a second refill from a newer import keeps out what the first one left out", {
+  tmp <- withr::local_tempdir()
+  fx <- refill_setup(tmp)
+  run_days(fx$pub, tmp, fx$truth, fx$ids, "2026-06-21", hour = "09:00:00", cran = c("a", "b"),
+           refill = TRUE)
+  # A new import whose releases all hold R-x, so nothing in it says to leave R-x out.
+  hist <- file.path(tmp, "history2.db")
+  write_history_fixture(hist, fx$truth, fx$ids, format(seq(as.Date("2026-06-12"), as.Date("2026-06-20"), by = "day")),
+                        unaggregated = c("2026-06-15", "2026-06-18"))
+  capture.output(imp <- import_release_snapshots(hist, file.path(fx$pub, "autoobs-downloads-recent.db"),
+                                                 fx$pub, file.path(fx$pub, COUNTERS_ASSET)))
+  expect_equal(nrow(imp$fill$left_out), 0L)
+  expect_setequal(imp$fill$covered, c("R-a", "R-b"))  # the preview reads what the first refill left out
+  r <- run_days(fx$pub, tmp, fx$truth, fx$ids, "2026-06-21", hour = "11:00:00", cran = c("a", "b"),
+                refill = TRUE)
+  got <- stored_vs_truth(file.path(r$out, "autoobs-downloads-recent.db"), fx$truth)
+  expect_equal(got$packages$rebuilt, c(1L, 1L, 0L))  # the stored release days have no rows for R-x
+  expect_true(got$same)
+  expect_equal(got$absent, 0L)
+  expect_false(any(got$daily$package == "R-x" & got$daily$date %in% got$days$date[got$days$method == "release"]))
+  expect_equal(r$res$manifest$counters$import$packages, 2L)
+  expect_equal(r$res$manifest$counters$import$left_out, 0L)
+})

@@ -39,6 +39,8 @@ iso <- function(t) format(t, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
 
 # Embed the summary table and the name->id cache into the recent shard, so a
 # single download answers most queries and the next run can skip re-resolving ids.
+# `rebuilt` says whether a refill covered the package (1), did not (0), or the
+# package was first listed after it (NULL).
 embed_aux <- function(recent_path, summary_df, cache_df) {
   con <- DBI::dbConnect(RSQLite::SQLite(), recent_path)
   on.exit(DBI::dbDisconnect(con), add = TRUE)
@@ -48,11 +50,11 @@ embed_aux <- function(recent_path, summary_df, cache_df) {
   DBI::dbExecute(con, "DROP TABLE IF EXISTS autoobs_packages")
   DBI::dbExecute(con, "CREATE TABLE autoobs_packages
     (package TEXT PRIMARY KEY, id INTEGER, autocran_only INTEGER,
-     origin TEXT, canonical_name TEXT, identity_state TEXT)")
+     origin TEXT, canonical_name TEXT, identity_state TEXT, rebuilt INTEGER)")
   if (nrow(cache_df) > 0)
     DBI::dbWriteTable(con, "autoobs_packages",
       cache_df[c("package", "id", "autocran_only",
-                 "origin", "canonical_name", "identity_state")], append = TRUE)
+                 "origin", "canonical_name", "identity_state", "rebuilt")], append = TRUE)
 }
 
 # Download the identity assets, load the name maps, and size-gate them; returns
@@ -81,21 +83,38 @@ prior_counters_state <- function(io, prev, out_dir) {
   "download_failed"
 }
 
-counters_entry <- function(prev, state, cst = NULL, window_days = COUNTERS_WINDOW_DAYS) {
+counters_entry <- function(prev, state, cst = NULL, window_days = COUNTERS_WINDOW_DAYS,
+                           import = prev$counters$import) {
   if (identical(state, "download_failed")) {
     m <- prev$counters
     m$published <- FALSE
     m$prior <- state
+    m$import <- import
     return(m)
   }
   at <- function(x) iso(as.POSIXct(as.numeric(x), origin = "1970-01-01", tz = "UTC"))
   list(asset = COUNTERS_ASSET, published = TRUE, prior = state,
        window_days = window_days, rows = cst$rows, runs = cst$runs,
-       first_run = at(cst$first_run), last_run = at(cst$last_run))
+       first_run = at(cst$first_run), last_run = at(cst$last_run), import = import)
+}
+
+# The imported snapshot counters a refill run needs; without them it stops before
+# anything is written.
+read_import <- function(io, out_dir) {
+  path <- file.path(out_dir, COUNTERS_IMPORT_ASSET)
+  code <- tryCatch(io$release_download(COUNTERS_IMPORT_ASSET, out_dir), error = function(e) 1L)
+  if (!identical(as.integer(code), 0L) || !counters_readable(path))
+    stop("refill needs ", COUNTERS_IMPORT_ASSET, " on the release; nothing was written")
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  list(runs = normalize_runs(DBI::dbReadTable(con, "autoobs_runs")),
+       counters = DBI::dbReadTable(con, "autoobs_counters")[names(empty_counters())],
+       sha256 = file_sha256(path))
 }
 
 run_update <- function(io, out_dir, force_full = FALSE,
-                       cran_floor = CRAN_NAMES_FLOOR, bioc_floor = BIOC_NAMES_FLOOR) {
+                       cran_floor = CRAN_NAMES_FLOOR, bioc_floor = BIOC_NAMES_FLOOR,
+                       refill = FALSE) {
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
   manifest_path <- file.path(out_dir, "manifest.json")
   recent_path   <- file.path(out_dir, "autoobs-downloads-recent.db")
@@ -115,6 +134,7 @@ run_update <- function(io, out_dir, force_full = FALSE,
   prev <- if (file.exists(manifest_path))
     jsonlite::fromJSON(manifest_path, simplifyVector = FALSE) else list()
   prev_shards <- prev$shards %||% list()
+  imp <- if (isTRUE(refill)) read_import(io, out_dir) else NULL
 
   now            <- io$now()
   snapshot_date  <- as.Date(format(now, "%Y-%m-%d", tz = "UTC"))
@@ -127,7 +147,7 @@ run_update <- function(io, out_dir, force_full = FALSE,
   cache      <- data.frame(package = character(0), id = integer(0),
                            autocran_only = integer(0), origin = character(0),
                            canonical_name = character(0), identity_state = character(0),
-                           stringsAsFactors = FALSE)
+                           rebuilt = integer(0), stringsAsFactors = FALSE)
   daily_hist <- data.frame(package = character(0), date = character(0),
                            count = integer(0), stringsAsFactors = FALSE)
   load_daily <- function(path) {
@@ -148,6 +168,7 @@ run_update <- function(io, out_dir, force_full = FALSE,
       if (!"origin"         %in% names(cache)) cache$origin         <- rep(NA_character_, nrow(cache))
       if (!"canonical_name" %in% names(cache)) cache$canonical_name <- rep(NA_character_, nrow(cache))
       if (!"identity_state" %in% names(cache)) cache$identity_state <- rep(NA_character_, nrow(cache))
+      if (!"rebuilt"        %in% names(cache)) cache$rebuilt        <- rep(NA_integer_,   nrow(cache))
     }
     DBI::dbDisconnect(rc)
     load_daily(recent_path)
@@ -190,8 +211,9 @@ run_update <- function(io, out_dir, force_full = FALSE,
       resolved$origin         <- NA_character_
       resolved$canonical_name <- NA_character_
       resolved$identity_state <- NA_character_
+      resolved$rebuilt        <- NA_integer_
       cache <- rbind(cache, resolved[c("package", "id", "autocran_only",
-                                       "origin", "canonical_name", "identity_state")])
+                                       "origin", "canonical_name", "identity_state", "rebuilt")])
     }
   }
   cache <- cache[!duplicated(cache$package) & !is.na(cache$id), , drop = FALSE]
@@ -267,20 +289,52 @@ run_update <- function(io, out_dir, force_full = FALSE,
     days_all <- upsert_days(days_all, day_rows(daily_all, attribute_date, "cnt_1d", run_id))
 
   # Fill missed days from this run's windows. When the day before was not
-  # counted, the last window day may not have been either (sure_end).
+  # counted, the last window day may not have been either (sure_end). A 'release'
+  # day holds no data for packages a refill did not cover, so a window over one
+  # leaves them out.
   fill <- list(rows = daily_all[0, c("package", "date", "count")], days = empty_days(),
                rejected = 0L, residual = 0L)
   if (nrow(days_all) > 0) {
     fill <- solve_days(run_equations(stats_df, snap_str, rec$window_end, "window",
                                      sure_end = day_aggregated, run_id = run_id),
                        daily_all[c("package", "date", "count")], days_all$date,
-                       floor = min(days_all$date), run_id = run_id)
+                       floor = min(days_all$date), run_id = run_id,
+                       partial = days_all$date[days_all$method == "release"],
+                       uncovered = cache$package[cache$rebuilt %in% 0L])
     daily_all <- rbind(daily_all[c("package", "date", "count")], fill$rows)
     days_all  <- upsert_days(days_all, fill$days)
   }
   rec$days_filled     <- nrow(fill$days)
   rec$fill_rejected   <- as.integer(fill$rejected)
   rec$window_residual <- as.integer(fill$residual)
+
+  # Refill: rebuild past days from the imported snapshots and every run's
+  # counters, over the packages every later snapshot holds.
+  import_meta <- prev$counters$import
+  if (!is.null(imp)) {
+    real_cn <- if (!is.null(cst)) read_counters(counters_path) else counters_rows(stats_df, run_id)
+    rf <- refill_solve(merge_runs(runs_prev, run_row(rec)), real_cn, imp$runs, imp$counters,
+                       daily_all, days_all, run_id,
+                       covered = cache$package[cache$rebuilt %in% 1L],
+                       skip = cache$package[cache$rebuilt %in% 0L])
+    cache$rebuilt <- as.integer(cache$package %in% rf$covered)
+    daily_all <- rbind(daily_all, rf$rows)
+    days_all  <- upsert_days(days_all, rf$days)
+    fill$days <- rbind(fill$days, rf$days)
+    runs_prev <- merge_runs(runs_prev, rf$kept)
+    rec$days_filled     <- rec$days_filled + nrow(rf$days)
+    rec$fill_rejected   <- rec$fill_rejected + as.integer(rf$rejected)
+    rec$window_residual <- max(rec$window_residual, as.integer(rf$residual))
+    rec$reason <- "refill"
+    import_meta <- list(asset = COUNTERS_IMPORT_ASSET, sha256 = imp$sha256,
+                        runs = nrow(imp$runs), kept = nrow(rf$kept), dropped = nrow(rf$dropped),
+                        packages = length(rf$covered), left_out = nrow(rf$left_out),
+                        days_filled = nrow(rf$days), refilled_at = iso(now))
+    for (i in seq_len(nrow(rf$dropped)))
+      message("refill dropped run ", rf$dropped$run_id[i], ": ", rf$dropped$reason[i])
+    if (nrow(rf$left_out) > 0)
+      message("refill left out ", nrow(rf$left_out), " packages that not every snapshot holds")
+  }
 
   # Classify packages as autoCRAN-only vs also-shipped-elsewhere (via
   # package_locations): always for newly-seen names, and for the whole set at most
@@ -387,7 +441,7 @@ run_update <- function(io, out_dir, force_full = FALSE,
     last_classified = if (isTRUE(classified_full)) iso(now) else (prev$last_classified %||% NULL),
     changed_shards = as.list(changed_shards),
     shards         = merge_shard_coverage(prev_shards, shard_updates),
-    counters       = counters_entry(prev, counters_prior, cst),
+    counters       = counters_entry(prev, counters_prior, cst, import = import_meta),
     summary        = list(
       packages         = nrow(summary_df),
       in_scope         = nrow(summary_df),
@@ -578,7 +632,8 @@ if (sys.nframe() == 0L) {
   args       <- commandArgs(trailingOnly = TRUE)
   out_dir    <- if (length(args) >= 1) args[1] else "out"
   force_full <- tolower(Sys.getenv("AUTOOBS_FORCE_REBUILD", "")) %in% c("true", "1", "yes")
-  res <- run_update(default_io(), out_dir, force_full = force_full)
+  refill     <- tolower(Sys.getenv("AUTOOBS_REFILL", "")) %in% c("true", "1", "yes")
+  res <- run_update(default_io(), out_dir, force_full = force_full, refill = refill)
   cat("Changed shards:", if (length(res$changed_shards))
         paste(res$changed_shards, collapse = ", ") else "(none)", "\n")
 }
