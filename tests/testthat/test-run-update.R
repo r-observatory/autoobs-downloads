@@ -593,3 +593,231 @@ test_that("runs on a release made before the run record start the record", {
   expect_equal(man3$counters$prior, "none")
   expect_true(man3$counters$published)
 })
+
+# Runs the pipeline once per snapshot date against a truth series and publishes.
+# `last` names, per snapshot date, the last day MirrorCache had counted when it is
+# further behind than one day; `cran` is the in-scope set; `...` goes to run_update.
+run_days <- function(pub, tmp, truth, ids, dates, unaggregated = character(0), hour = "04:00:00",
+                     last = list(), cran = sub("^R-", "", names(ids)), ...) {
+  res <- NULL
+  for (S in dates) {
+    out <- file.path(tmp, paste0("o", gsub("-", "", S), gsub(":", "", hour)))
+    cn  <- mc_counters(truth, ids, S, aggregated = !(S %in% unaggregated), last = last[[S]])
+    res <- run_update(fake_io(pub, names(ids), ids, cn[setdiff(names(cn), "package")],
+                              as.POSIXct(paste(S, hour), tz = "UTC"), cran = cran),
+                      out, cran_floor = 1L, bioc_floor = 0L, ...)
+    publish(out, pub)
+  }
+  list(out = out, res = res)
+}
+
+test_that("run_update fills a missed day at the next aggregated run", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  ids <- c("R-a" = 1L, "R-b" = 2L)
+  truth <- fill_truth("2026-06-01")
+  dates <- format(seq(as.Date("2026-06-02"), as.Date("2026-06-11"), by = "day"))
+  r <- run_days(pub, tmp, truth, ids, dates, unaggregated = "2026-06-10")
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(r$out, "autoobs-downloads-recent.db"))
+  on.exit(DBI::dbDisconnect(con))
+  got <- DBI::dbGetQuery(con, "SELECT package, count FROM autoobs_downloads_daily
+                                WHERE date = '2026-06-09' ORDER BY package")
+  want <- truth[truth$date == "2026-06-09", ]
+  expect_equal(got$count, want$count[order(want$package)])
+  days <- DBI::dbGetQuery(con, "SELECT date, method FROM autoobs_days ORDER BY date")
+  expect_equal(days$date, format(seq(as.Date("2026-06-01"), as.Date("2026-06-10"), by = "day")))
+  expect_equal(days$method[days$date == "2026-06-09"], "window")
+  expect_equal(days$method[days$date == "2026-06-10"], "cnt_1d")
+  runs <- DBI::dbGetQuery(con, "SELECT days_filled, fill_rejected, window_residual
+                                 FROM autoobs_runs ORDER BY run_id DESC LIMIT 1")
+  expect_equal(unlist(runs, use.names = FALSE), c(1L, 0L, 0L))
+  con2 <- DBI::dbConnect(RSQLite::SQLite(), file.path(r$out, "autoobs-downloads-2026.db"))
+  on.exit(DBI::dbDisconnect(con2), add = TRUE)
+  expect_equal(DBI::dbGetQuery(con2, "SELECT method FROM autoobs_days WHERE date = '2026-06-09'")$method,
+               "window")
+  expect_equal(DBI::dbListFields(con2, "autoobs_downloads_daily"), c("package", "date", "count"))
+})
+
+test_that("a January run that fills a December day re-exports and lists that year's shard", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  ids <- c("R-a" = 1L, "R-b" = 2L)
+  truth <- fill_truth("2025-12-20", "2026-01-02")
+  dates <- format(seq(as.Date("2025-12-25"), as.Date("2026-01-02"), by = "day"))
+  r <- run_days(pub, tmp, truth, ids, dates, unaggregated = "2026-01-01")
+  expect_true(all(c("autoobs-downloads-2025.db", "autoobs-downloads-2026.db") %in% r$res$changed_shards))
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(r$out, "autoobs-downloads-2025.db"))
+  on.exit(DBI::dbDisconnect(con))
+  expect_equal(DBI::dbGetQuery(con, "SELECT SUM(count) n FROM autoobs_downloads_daily
+                                      WHERE date = '2025-12-31'")$n,
+               sum(truth$count[truth$date == "2025-12-31"]))
+  man <- jsonlite::fromJSON(file.path(r$out, "manifest.json"), simplifyVector = FALSE)
+  expect_equal(man$shards[["autoobs-downloads-2025.db"]]$date_max, "2025-12-31")
+})
+
+test_that("a same-day rerun with failed fetches keeps the stored rows it missed", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  names <- c("R-a", "R-b"); idmap <- c("R-a" = 1L, "R-b" = 2L)
+  run_update(fake_io(pub, names, idmap, day_stats(stats_row(1, 10, 70, 300, 0), stats_row(2, 5, 9, 40, 0)),
+                     as.POSIXct("2026-06-11 04:00:00", tz = "UTC")), file.path(tmp, "o1"),
+             cran_floor = 1L, bioc_floor = 0L)
+  publish(file.path(tmp, "o1"), pub)
+  run_update(fake_io(pub, names, idmap, day_stats(stats_row(1, 13, 73, 303, 0), na_stats_row(2)),
+                     as.POSIXct("2026-06-11 18:00:00", tz = "UTC")), file.path(tmp, "o2"),
+             cran_floor = 1L, bioc_floor = 0L)
+  publish(file.path(tmp, "o2"), pub)
+  run_update(fake_io(pub, names, idmap, day_stats(stats_row(1, 0, 60, 290, 0), stats_row(2, 0, 4, 35, 0)),
+                     as.POSIXct("2026-06-11 20:00:00", tz = "UTC")), file.path(tmp, "o3"),
+             cran_floor = 1L, bioc_floor = 0L)
+  for (o in c("o2", "o3")) {
+    con <- DBI::dbConnect(RSQLite::SQLite(), file.path(tmp, o, "autoobs-downloads-recent.db"))
+    d <- DBI::dbGetQuery(con, "SELECT package, count FROM autoobs_downloads_daily
+                                WHERE date = '2026-06-10' ORDER BY package")
+    DBI::dbDisconnect(con)
+    expect_equal(d$package, c("R-a", "R-b"))
+    expect_equal(d$count, c(13L, 5L))        # R-a replaced, R-b kept; the unaggregated rerun changes nothing
+  }
+})
+
+test_that("the first run on a shard without autoobs_days bootstraps it from the stored dates", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  names <- "R-a"; idmap <- c("R-a" = 1L)
+  run_update(fake_io(pub, names, idmap, stats_row(1, 10, 70, 300, 0),
+                     as.POSIXct("2026-06-11 04:00:00", tz = "UTC")), file.path(tmp, "o1"),
+             cran_floor = 1L, bioc_floor = 0L)
+  publish(file.path(tmp, "o1"), pub)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(pub, "autoobs-downloads-recent.db"))
+  DBI::dbExecute(con, "DROP TABLE autoobs_days")
+  DBI::dbDisconnect(con)
+  run_update(fake_io(pub, names, idmap, stats_row(1, 0, 70, 300, 0),
+                     as.POSIXct("2026-06-12 04:00:00", tz = "UTC")), file.path(tmp, "o2"),
+             cran_floor = 1L, bioc_floor = 0L)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(tmp, "o2", "autoobs-downloads-recent.db"))
+  on.exit(DBI::dbDisconnect(con))
+  d <- DBI::dbGetQuery(con, "SELECT date, method, run_id FROM autoobs_days")
+  expect_equal(d$date, "2026-06-10")
+  expect_equal(d$method, "cnt_1d")
+  expect_true(is.na(d$run_id))
+})
+
+test_that("run rows written before the fill columns existed are carried with NA", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  names <- "R-a"; idmap <- c("R-a" = 1L)
+  run_update(fake_io(pub, names, idmap, stats_row(1, 10, 70, 300, 0),
+                     as.POSIXct("2026-06-11 04:00:00", tz = "UTC")), file.path(tmp, "o1"),
+             cran_floor = 1L, bioc_floor = 0L)
+  publish(file.path(tmp, "o1"), pub)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(pub, "autoobs-downloads-recent.db"))
+  DBI::dbExecute(con, "CREATE TABLE old_runs AS SELECT run_id, run_at, snapshot_date, source, outcome,
+                         day_aggregated, window_end, counters_prior FROM autoobs_runs")
+  DBI::dbExecute(con, "DROP TABLE autoobs_runs")
+  DBI::dbExecute(con, "ALTER TABLE old_runs RENAME TO autoobs_runs")
+  DBI::dbDisconnect(con)
+  run_update(fake_io(pub, names, idmap, stats_row(1, 12, 80, 310, 0),
+                     as.POSIXct("2026-06-12 04:00:00", tz = "UTC")), file.path(tmp, "o2"),
+             cran_floor = 1L, bioc_floor = 0L)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(tmp, "o2", "autoobs-downloads-summary.db"))
+  on.exit(DBI::dbDisconnect(con))
+  r <- DBI::dbGetQuery(con, "SELECT snapshot_date, days_filled, stats_requested FROM autoobs_runs ORDER BY run_id")
+  expect_equal(r$snapshot_date, c("2026-06-11", "2026-06-12"))
+  expect_equal(r$days_filled, c(NA, 0L))
+  expect_equal(r$stats_requested, c(NA, 1L))
+})
+
+test_that("a day MirrorCache later revises is not rewritten and shows in the residual", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  ids <- c("R-a" = 1L, "R-b" = 2L)
+  truth <- fill_truth("2026-06-01")
+  run_days(pub, tmp, truth, ids, format(seq(as.Date("2026-06-02"), as.Date("2026-06-11"), by = "day")))
+  revised <- truth
+  revised$count[revised$package == "R-a" & revised$date == "2026-06-08"] <-
+    revised$count[revised$package == "R-a" & revised$date == "2026-06-08"] + 5L
+  r <- run_days(pub, tmp, revised, ids, "2026-06-12")
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(r$out, "autoobs-downloads-recent.db"))
+  on.exit(DBI::dbDisconnect(con))
+  kept <- DBI::dbGetQuery(con, "SELECT count FROM autoobs_downloads_daily
+                                 WHERE package = 'R-a' AND date = '2026-06-08'")$count
+  expect_equal(kept, truth$count[truth$package == "R-a" & truth$date == "2026-06-08"])
+  run <- DBI::dbGetQuery(con, "SELECT days_filled, window_residual FROM autoobs_runs
+                                ORDER BY run_id DESC LIMIT 1")
+  expect_equal(run$days_filled, 0L)
+  expect_equal(run$window_residual, 1L)
+})
+
+test_that("the second of two unaggregated runs fills the first one's day", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  ids <- c("R-a" = 1L, "R-b" = 2L)
+  truth <- fill_truth("2026-06-01", "2026-06-11")
+  dates <- format(seq(as.Date("2026-06-02"), as.Date("2026-06-11"), by = "day"))
+  r <- run_days(pub, tmp, truth, ids, dates, unaggregated = c("2026-06-10", "2026-06-11"))
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(r$out, "autoobs-downloads-recent.db"))
+  on.exit(DBI::dbDisconnect(con))
+  days <- DBI::dbGetQuery(con, "SELECT date, method FROM autoobs_days WHERE date >= '2026-06-09'")
+  expect_equal(days$date, "2026-06-09")              # 06-10 is still a hole
+  expect_equal(days$method, "window")
+  got <- DBI::dbGetQuery(con, "SELECT package, count FROM autoobs_downloads_daily
+                                WHERE date = '2026-06-09' ORDER BY package")
+  want <- truth[truth$date == "2026-06-09", ]
+  expect_equal(got$count, want$count[order(want$package)])
+})
+
+test_that("a day MirrorCache counts two days late is never recorded as uncounted", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  ids <- c("R-a" = 1L, "R-b" = 2L)
+  truth <- fill_truth("2026-05-01", "2026-06-20")
+  dates <- format(seq(as.Date("2026-05-19"), as.Date("2026-06-17"), by = "day"))
+  # 06-09 is uncounted at the 06-10 run and still uncounted at the 06-11 run.
+  late <- list("2026-06-10" = "2026-06-08", "2026-06-11" = "2026-06-08")
+  r <- run_days(pub, tmp, truth, ids, dates[dates <= "2026-06-12"], last = late)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(r$out, "autoobs-downloads-recent.db"))
+  days <- DBI::dbGetQuery(con, "SELECT date, method FROM autoobs_days")
+  runs <- DBI::dbGetQuery(con, "SELECT snapshot_date, days_filled, fill_rejected FROM autoobs_runs
+                                 WHERE snapshot_date >= '2026-06-11' ORDER BY run_id")
+  DBI::dbDisconnect(con)
+  expect_false(any(c("2026-06-09", "2026-06-10") %in% days$date))   # both stay holes
+  expect_false("upstream_missing" %in% days$method)
+  expect_equal(runs$days_filled, c(0L, 0L))
+  expect_equal(runs$fill_rejected, c(0L, 0L))
+
+  # Later windows hold each day alone and fill it with the real counts.
+  r <- run_days(pub, tmp, truth, ids, dates[dates > "2026-06-12"])
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(r$out, "autoobs-downloads-recent.db"))
+  on.exit(DBI::dbDisconnect(con))
+  days <- DBI::dbGetQuery(con, "SELECT date, method FROM autoobs_days ORDER BY date")
+  expect_equal(days$method[days$date %in% c("2026-06-09", "2026-06-10")], c("window", "window"))
+  d <- DBI::dbGetQuery(con, "SELECT package, date, count FROM autoobs_downloads_daily")
+  m <- merge(d, truth[truth$count > 0, ], by = c("package", "date"), all = TRUE)
+  m <- m[m$date >= "2026-05-18" & m$date <= "2026-06-16", ]
+  expect_false(anyNA(m$count.x))
+  expect_equal(m$count.x, m$count.y)                 # every stored value is the truth
+})
+
+test_that("a MirrorCache more than a week behind never has a day recorded as uncounted", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  ids <- c("R-a" = 1L, "R-b" = 2L)
+  truth <- fill_truth("2026-05-01", "2026-06-20")
+  dates <- format(seq(as.Date("2026-05-19"), as.Date("2026-06-19"), by = "day"))
+  # Nothing after 06-08 is counted until the 06-18 run: eight runs read the same windows.
+  stale <- format(seq(as.Date("2026-06-10"), as.Date("2026-06-17"), by = "day"))
+  late <- stats::setNames(rep(list("2026-06-08"), length(stale)), stale)
+  r <- run_days(pub, tmp, truth, ids, dates[dates <= "2026-06-17"], last = late)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(r$out, "autoobs-downloads-recent.db"))
+  days <- DBI::dbGetQuery(con, "SELECT date, method FROM autoobs_days")
+  DBI::dbDisconnect(con)
+  expect_equal(max(days$date), "2026-06-08")         # 06-09, eight days back, stays a hole
+  expect_false("upstream_missing" %in% days$method)
+
+  # MirrorCache catches up: the next windows must not read 06-09 as a zero day.
+  r <- run_days(pub, tmp, truth, ids, dates[dates > "2026-06-17"])
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(r$out, "autoobs-downloads-recent.db"))
+  on.exit(DBI::dbDisconnect(con))
+  days <- DBI::dbGetQuery(con, "SELECT date, method FROM autoobs_days ORDER BY date")
+  expect_equal(days$date[days$date > "2026-06-08"], c("2026-06-17", "2026-06-18"))
+  expect_false("upstream_missing" %in% days$method)
+  runs <- DBI::dbGetQuery(con, "SELECT SUM(fill_rejected) r, SUM(window_residual) w FROM autoobs_runs")
+  expect_equal(c(runs$r, runs$w), c(0L, 0L))
+  d <- DBI::dbGetQuery(con, "SELECT package, date, count FROM autoobs_downloads_daily")
+  m <- merge(d, truth[truth$count > 0, ], by = c("package", "date"), all = TRUE)
+  m <- m[m$date %in% days$date, ]
+  expect_false(anyNA(m$count.x))
+  expect_equal(m$count.x, m$count.y)                 # every stored value is the truth
+})
