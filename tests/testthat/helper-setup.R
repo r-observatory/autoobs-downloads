@@ -87,3 +87,53 @@ snapshot_fixture <- function(truth, ids, S, source = "observatory.db x", last = 
                             window_end = window_end_for(S, cs$day_aggregated)), cs)),
        cn = cbind(cn[setdiff(names(cn), c("id", "first_seen"))], run_id = rid))
 }
+
+# A history.db as the history build in r-observatory/data writes it: one dated
+# release per snapshot date, the series recorded as 'autoobs_summary' with
+# outcome 'applied', and its counters folded into autoobs_summary_history
+# episodes (first_seen and last_seen are snapshot days). The names are literal
+# here so a drift in config.R shows up. `observe` overrides a tag's series,
+# outcome, rows_read or source_as_of. `wide` (ids, until) makes the releases up
+# to a date hold more packages, as the real ones did before the scope filter.
+write_history_fixture <- function(path, truth, ids, dates, unaggregated = character(0),
+                                  observe = list(), wide = NULL) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), path); on.exit(DBI::dbDisconnect(con))
+  DBI::dbExecute(con, "CREATE TABLE history_snapshots (family TEXT, tag TEXT, snapshot_at TEXT,
+    snapshot_on TEXT, asset TEXT, bytes INTEGER, sha256 TEXT, outcome TEXT, note TEXT,
+    processed_at TEXT, PRIMARY KEY (family, tag))")
+  DBI::dbExecute(con, "CREATE TABLE history_series_observations (family TEXT, tag TEXT, series TEXT,
+    rows_read INTEGER, rows_kept INTEGER, outcome TEXT, source_as_of TEXT, columns TEXT)")
+  DBI::dbExecute(con, "CREATE TABLE autoobs_summary_history (package TEXT, episode_seq INTEGER,
+    origin TEXT, identity_state TEXT, total_1d INTEGER, total_7d INTEGER, total_30d INTEGER,
+    cnt_total INTEGER, first_seen TEXT, last_seen TEXT, ended_on TEXT, PRIMARY KEY (package, episode_seq))")
+  open <- list(); done <- list(); vals <- c("total_1d", "total_7d", "total_30d", "cnt_total")
+  for (D in dates) {
+    use <- if (!is.null(wide) && D <= wide$until) wide$ids else ids
+    cn <- mc_counters(truth, use, D, aggregated = !(D %in% unaggregated))
+    cn <- data.frame(package = cn$package, total_1d = cn$cnt_1d, total_7d = cn$cnt_7d,
+                     total_30d = cn$cnt_30d, cnt_total = cn$cnt_total, stringsAsFactors = FALSE)
+    for (p in setdiff(names(open), cn$package)) {      # no longer held: the episode ends
+      o <- open[[p]]; o$ended_on <- D; done[[length(done) + 1L]] <- o; open[[p]] <- NULL
+    }
+    for (i in seq_len(nrow(cn))) {
+      p <- cn$package[i]; o <- open[[p]]
+      if (!is.null(o) && identical(unlist(o[vals]), unlist(cn[i, vals]))) { open[[p]]$last_seen <- D; next }
+      if (!is.null(o)) { o$ended_on <- D; done[[length(done) + 1L]] <- o }
+      open[[p]] <- c(list(package = p, episode_seq = if (is.null(o)) 1L else o$episode_seq + 1L,
+                          origin = "cran", identity_state = "live"),
+                     as.list(cn[i, vals]), list(first_seen = D, last_seen = D, ended_on = NA_character_))
+    }
+    tag <- paste0("v", D); ob <- observe[[tag]] %||% list()
+    DBI::dbExecute(con, "INSERT INTO history_snapshots (family, tag, snapshot_at, snapshot_on, outcome)
+                         VALUES ('data', ?, ?, ?, 'processed')",
+                   params = list(tag, paste0(D, "T21:00:00Z"), D))
+    DBI::dbExecute(con, "INSERT INTO history_series_observations
+                         VALUES ('data', ?, ?, ?, ?, ?, ?, NULL)",
+                   params = list(tag, ob$series %||% "autoobs_summary", ob$rows_read %||% nrow(cn),
+                                 nrow(cn), ob$outcome %||% "applied",
+                                 ob$source_as_of %||% D))
+  }
+  eps <- do.call(rbind, lapply(c(done, open), as.data.frame, stringsAsFactors = FALSE))
+  DBI::dbWriteTable(con, "autoobs_summary_history", eps, append = TRUE)
+  invisible(path)
+}

@@ -51,3 +51,13 @@ BIOC_NAMES_FLOOR  <- 1500L
 # record, so a failed download of this asset never stops a run.
 COUNTERS_ASSET       <- "autoobs-counters-recent.db"
 COUNTERS_WINDOW_DAYS <- 40L
+
+# A refill run reads the snapshot counters rebuilt from the history asset. The
+# history build records the series as 'autoobs_summary' (its episodes are in the
+# table autoobs_summary_history), an applied fold as 'applied' and a release it
+# read as 'processed'.
+COUNTERS_IMPORT_ASSET   <- "autoobs-counters-import.db"
+HISTORY_AUTOOBS_SERIES  <- "autoobs_summary"
+HISTORY_AUTOOBS_TABLE   <- "autoobs_summary_history"
+HISTORY_APPLIED_OUTCOME <- "applied"
+HISTORY_PROCESSED       <- "processed"

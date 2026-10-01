@@ -901,3 +901,91 @@ refill_solve <- function(runs, counters, import_runs, import_counters, daily, da
               dropped = data.frame(run_id = import_runs$run_id[!v$keep],
                                    reason = v$reason[!v$keep], stringsAsFactors = FALSE)))
 }
+
+# Stops unless history.db has what the import reads.
+check_history_contract <- function(con) {
+  need <- stats::setNames(list(
+    c("family", "tag", "snapshot_on", "outcome"),
+    c("family", "tag", "series", "rows_read", "outcome", "source_as_of"),
+    c("package", "total_1d", "total_7d", "total_30d", "cnt_total", "first_seen", "last_seen")),
+    c("history_snapshots", "history_series_observations", HISTORY_AUTOOBS_TABLE))
+  have <- DBI::dbListTables(con)
+  for (t in names(need)) {
+    if (!t %in% have) stop("history.db has no table ", t)
+    miss <- setdiff(need[[t]], DBI::dbListFields(con, t))
+    if (length(miss)) stop("history.db ", t, " lacks ", paste(miss, collapse = ", "))
+  }
+  n <- DBI::dbGetQuery(con, "SELECT COUNT(*) AS n FROM history_series_observations
+                              WHERE series = ? AND outcome = ?",
+                       params = list(HISTORY_AUTOOBS_SERIES, HISTORY_APPLIED_OUTCOME))$n
+  if (n == 0) {
+    seen <- DBI::dbGetQuery(con, "SELECT DISTINCT series, outcome FROM history_series_observations")
+    stop("no ", HISTORY_AUTOOBS_SERIES, "/", HISTORY_APPLIED_OUTCOME, " observations; found: ",
+         paste(seen$series, seen$outcome, sep = "/", collapse = ", "))
+  }
+  invisible(TRUE)
+}
+
+# The autoobs summary counters each applied snapshot held, rebuilt from the
+# episodes spanning its snapshot_on day.
+history_autoobs_snapshots <- function(con) {
+  obs <- DBI::dbGetQuery(con, "
+    SELECT o.tag, o.source_as_of, o.rows_read, s.snapshot_on AS snap_day
+      FROM history_series_observations o
+      JOIN history_snapshots s ON s.family = o.family AND s.tag = o.tag
+     WHERE o.series = ? AND o.outcome = ? AND s.outcome = ? AND o.source_as_of IS NOT NULL
+     ORDER BY s.snapshot_on, o.tag",
+    params = list(HISTORY_AUTOOBS_SERIES, HISTORY_APPLIED_OUTCOME, HISTORY_PROCESSED))
+  lapply(seq_len(nrow(obs)), function(i) {
+    rows <- DBI::dbGetQuery(con, sprintf("
+      SELECT package, total_1d, total_7d, total_30d, cnt_total FROM %s
+       WHERE first_seen <= ? AND last_seen >= ?", HISTORY_AUTOOBS_TABLE),
+      params = list(obs$snap_day[i], obs$snap_day[i]))
+    list(tag = obs$tag[i], source_as_of = obs$source_as_of[i],
+         rows_read = as.integer(obs$rows_read[i]), rows = rows)
+  })
+}
+
+# Synthetic runs and counters, one per autoobs snapshot date, with a log line
+# per dated release.
+snapshot_runs <- function(snaps) {
+  runs <- list(); counters <- list(); seen <- character(0)
+  log <- data.frame(tag = character(0), source_as_of = character(0), rows = integer(0),
+                    outcome = character(0), reason = character(0), stringsAsFactors = FALSE)
+  note <- function(sn, outcome, reason) rbind(log, data.frame(tag = sn$tag,
+    source_as_of = sn$source_as_of, rows = nrow(sn$rows), outcome = outcome, reason = reason,
+    stringsAsFactors = FALSE))
+  for (sn in snaps) {
+    if (nrow(sn$rows) != sn$rows_read) { log <- note(sn, "dropped", "episode rows differ from rows_read"); next }
+    if (sn$source_as_of %in% seen) { log <- note(sn, "dropped", "same autoobs run as an earlier release"); next }
+    seen <- c(seen, sn$source_as_of)
+    rid <- as.integer(as.numeric(as.POSIXct(sn$source_as_of, tz = "UTC")))
+    cn <- data.frame(run_id = rid, package = sn$rows$package, cnt_today = NA_integer_,
+                     cnt_1d = as.integer(sn$rows$total_1d), cnt_7d = as.integer(sn$rows$total_7d),
+                     cnt_30d = as.integer(sn$rows$total_30d), cnt_total = as.integer(sn$rows$cnt_total),
+                     stringsAsFactors = FALSE)
+    cs <- counter_stats(cn)
+    runs[[length(runs) + 1L]] <- run_row(c(list(
+      run_id = rid, run_at = NA_character_, snapshot_date = sn$source_as_of,
+      source = paste("observatory.db", sn$tag), outcome = "ok",
+      stats_non_na = nrow(cn), in_scope = nrow(cn),
+      window_end = window_end_for(sn$source_as_of, cs$day_aggregated)), cs))
+    counters[[length(counters) + 1L]] <- cn
+    log <- note(sn, "kept", NA_character_)
+  }
+  list(runs = if (length(runs)) do.call(rbind, runs) else normalize_runs(data.frame()),
+       counters = if (length(counters)) do.call(rbind, counters) else empty_counters(),
+       log = log)
+}
+
+# What an earlier refill decided per package: covered (autoobs_packages.rebuilt
+# = 1) and left out (0). Both empty when the column is not there yet.
+read_rebuilt <- function(path) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  if (!"autoobs_packages" %in% DBI::dbListTables(con) ||
+      !"rebuilt" %in% DBI::dbListFields(con, "autoobs_packages"))
+    return(list(covered = character(0), skip = character(0)))
+  r <- DBI::dbGetQuery(con, "SELECT package, rebuilt FROM autoobs_packages ORDER BY package")
+  list(covered = r$package[r$rebuilt %in% 1L], skip = r$package[r$rebuilt %in% 0L])
+}

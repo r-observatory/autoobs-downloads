@@ -275,3 +275,173 @@ test_that("a window that holds a release day leaves uncovered packages out", {
   expect_equal(g$rows$count[g$rows$package == "R-x"],
                truth$count[truth$package == "R-x" & truth$date == "2026-06-09"])
 })
+
+test_that("the history contract check names what is missing", {
+  p <- tempfile(fileext = ".db")
+  write_history_fixture(p, fill_truth(), ids2, "2026-06-05")
+  con <- DBI::dbConnect(RSQLite::SQLite(), p); on.exit(DBI::dbDisconnect(con))
+  expect_true(check_history_contract(con))     # the series is 'autoobs_summary', as the history build names it
+  # The table name is not the series name: a build that recorded it that way is refused.
+  DBI::dbExecute(con, "UPDATE history_series_observations SET series = 'autoobs_summary_history'")
+  expect_error(check_history_contract(con),
+               "no autoobs_summary/applied observations; found: autoobs_summary_history/applied")
+  DBI::dbExecute(con, "ALTER TABLE autoobs_summary_history DROP COLUMN cnt_total")
+  expect_error(check_history_contract(con), "lacks cnt_total")
+})
+
+test_that("snapshots are rebuilt from episodes, one per autoobs run", {
+  truth <- fill_truth()
+  p <- tempfile(fileext = ".db")
+  write_history_fixture(p, truth, ids2, c("2026-06-05", "2026-06-06", "2026-06-07", "2026-06-08"),
+                        observe = list("v2026-06-06" = list(outcome = "unhealthy"),
+                                       "v2026-06-07" = list(source_as_of = "2026-06-05"),
+                                       "v2026-06-08" = list(rows_read = 5L)))
+  con <- DBI::dbConnect(RSQLite::SQLite(), p); on.exit(DBI::dbDisconnect(con))
+  snaps <- history_autoobs_snapshots(con)
+  expect_equal(vapply(snaps, `[[`, "", "tag"), c("v2026-06-05", "v2026-06-07", "v2026-06-08"))
+  sr <- snapshot_runs(snaps)
+  expect_equal(sr$log$outcome, c("kept", "dropped", "dropped"))
+  expect_match(sr$log$reason[2], "same autoobs run")
+  expect_match(sr$log$reason[3], "rows_read")
+  expect_equal(sr$runs$run_id, as.integer(as.numeric(as.POSIXct("2026-06-05", tz = "UTC"))))
+  expect_equal(sr$runs$source, "observatory.db v2026-06-05")
+  expect_true(is.na(sr$runs$run_at))
+  expect_equal(sr$runs$window_end, "2026-06-04")
+  want <- mc_counters(truth, ids2, "2026-06-05")
+  got <- sr$counters[order(sr$counters$package), ]
+  expect_equal(got$cnt_7d, want$cnt_7d)
+  expect_equal(got$cnt_30d, want$cnt_30d)
+  expect_true(all(is.na(got$cnt_today)))
+})
+
+test_that("a snapshot the extraction skipped is not read", {
+  p <- tempfile(fileext = ".db")
+  write_history_fixture(p, fill_truth(), ids2, c("2026-06-05", "2026-06-06"))
+  con <- DBI::dbConnect(RSQLite::SQLite(), p); on.exit(DBI::dbDisconnect(con))
+  DBI::dbExecute(con, "UPDATE history_snapshots SET outcome = 'skipped' WHERE tag = 'v2026-06-05'")
+  expect_equal(vapply(history_autoobs_snapshots(con), `[[`, "", "tag"), "v2026-06-06")
+})
+
+test_that("the import script writes the import asset and reports the refill", {
+  truth <- fill_truth("2026-04-01", "2026-06-25")
+  tmp <- withr::local_tempdir()
+  hist <- file.path(tmp, "history.db")
+  write_history_fixture(hist, truth, ids2, format(seq(as.Date("2026-06-12"), as.Date("2026-06-20"), by = "day")),
+                        unaggregated = c("2026-06-15", "2026-06-18"))
+  recent <- file.path(tmp, "recent.db")
+  daily <- truth[truth$count > 0 & truth$date >= "2026-06-11" & truth$date <= "2026-06-19" &
+                 !(truth$date %in% c("2026-06-14", "2026-06-17")), ]
+  export_shard(recent, daily, days_df = bootstrap_days(daily))
+  source(file.path(.ao_root, "scripts", "import_release_snapshots.R"))
+  out <- capture.output(res <- import_release_snapshots(hist, recent, file.path(tmp, "out")))
+  expect_match(out[1], "snapshots: 9 read, 9 kept, 0 dropped")
+  expect_true(any(grepl("a refill would fill", out)))
+  expect_true(any(grepl("no counters asset given", out)))
+  con <- DBI::dbConnect(RSQLite::SQLite(), res$path); on.exit(DBI::dbDisconnect(con))
+  expect_setequal(DBI::dbListTables(con), c("autoobs_counters", "autoobs_runs", "autoobs_import_log",
+                                            "autoobs_import_left_out"))
+  expect_equal(DBI::dbGetQuery(con, "SELECT COUNT(*) n FROM autoobs_import_left_out")$n, 0L)
+  expect_equal(DBI::dbGetQuery(con, "SELECT COUNT(*) n FROM autoobs_runs")$n, 9L)
+  f <- res$fill
+  expect_true(all(c("2026-06-14", "2026-06-17") %in% f$days$date))
+  expect_true(any(f$days$date < "2026-06-11"))
+  expect_equal(f$rejected, 0L)
+  m <- merge(f$rows, truth, by = c("package", "date"))
+  expect_equal(m$count.x, m$count.y)
+  expect_equal(nrow(m), nrow(f$rows))
+})
+
+test_that("the import leaves out a package the later releases stopped holding", {
+  ids3 <- c(ids2, "R-x" = 3L)
+  truth <- with_outsider(fill_truth("2026-04-01", "2026-06-25"))
+  holes <- c("2026-06-14", "2026-06-17")
+  tmp <- withr::local_tempdir()
+  hist <- file.path(tmp, "history.db")
+  # The releases up to 06-13 held every tracked package, the later ones only R-a and R-b.
+  write_history_fixture(hist, truth, ids2, format(seq(as.Date("2026-06-12"), as.Date("2026-06-20"), by = "day")),
+                        unaggregated = c("2026-06-15", "2026-06-18"),
+                        wide = list(ids = ids3, until = "2026-06-13"))
+  daily <- truth[truth$count > 0 & truth$date >= "2026-06-11" & truth$date <= "2026-06-19" &
+                 !(truth$date %in% holes), ]
+  recent <- file.path(tmp, "recent.db")
+  export_shard(recent, daily, days_df = bootstrap_days(daily))
+  real <- snapshot_fixture(truth, ids3, "2026-06-20", source = "run", hour = 4L)
+  write_runs(recent, real$run)
+  cpath <- file.path(tmp, COUNTERS_ASSET)
+  update_counters(cpath, real$cn[names(empty_counters())], keep_from = 0L, fresh = TRUE)
+  source(file.path(.ao_root, "scripts", "import_release_snapshots.R"))
+  out <- capture.output(res <- import_release_snapshots(hist, recent, file.path(tmp, "out"), cpath))
+  expect_match(out[1], "snapshots: 9 read, 9 kept, 0 dropped")
+  expect_true(any(grepl("packages the snapshots cover: 2", out)))
+  expect_true(any(grepl("held by a snapshot and left out: 1 (R-x)", out, fixed = TRUE)))
+  con <- DBI::dbConnect(RSQLite::SQLite(), res$path); on.exit(DBI::dbDisconnect(con))
+  lo <- DBI::dbReadTable(con, "autoobs_import_left_out")
+  expect_equal(lo$package, "R-x")
+  expect_equal(lo$first_snapshot, "2026-06-12")
+  expect_equal(lo$missing_from, "2026-06-14")
+  expect_equal(lo$reason, "held by an earlier snapshot")
+  # The file keeps what each release held; the refill is what leaves R-x out.
+  expect_equal(DBI::dbGetQuery(con, "SELECT COUNT(*) n FROM autoobs_counters WHERE package = 'R-x'")$n, 2L)
+  f <- res$fill
+  expect_setequal(f$covered, c("R-a", "R-b"))
+  expect_true(all(holes %in% f$days$date))                  # both rebuilt from the later releases
+  expect_true(any(f$days$date < "2026-06-11"))              # and days from the early ones
+  expect_equal(f$rejected, 0L)
+  expect_equal(f$residual, 0L)
+  expect_false("R-x" %in% f$rows$package)
+  m <- merge(f$rows, truth, by = c("package", "date"))
+  expect_equal(nrow(m), nrow(f$rows))
+  expect_equal(m$count.x, m$count.y)
+})
+
+test_that("the preview keeps out a package an earlier refill left out", {
+  truth <- fill_truth("2026-04-01", "2026-06-25")
+  tmp <- withr::local_tempdir()
+  hist <- file.path(tmp, "history.db")
+  write_history_fixture(hist, truth, ids2, format(seq(as.Date("2026-06-12"), as.Date("2026-06-20"), by = "day")),
+                        unaggregated = "2026-06-15")
+  daily <- truth[truth$count > 0 & truth$date >= "2026-06-11" & truth$date <= "2026-06-19" &
+                 truth$date != "2026-06-14", ]
+  days <- rbind(bootstrap_days(daily), data.frame(date = "2026-06-10", method = "release", run_id = 5L,
+                                                  packages = 1L, downloads = 12L))
+  recent <- file.path(tmp, "recent.db")
+  export_shard(recent, rbind(daily, truth[truth$package == "R-a" & truth$date == "2026-06-10", ]),
+               days_df = days)
+  expect_equal(read_rebuilt(recent), list(covered = character(0), skip = character(0)))
+  con <- DBI::dbConnect(RSQLite::SQLite(), recent)
+  DBI::dbWriteTable(con, "autoobs_packages", data.frame(package = c("R-a", "R-b"), rebuilt = c(1L, 0L)))
+  DBI::dbDisconnect(con)
+  expect_equal(read_rebuilt(recent), list(covered = "R-a", skip = "R-b"))
+  source(file.path(.ao_root, "scripts", "import_release_snapshots.R"))
+  capture.output(res <- import_release_snapshots(hist, recent, file.path(tmp, "out")))
+  expect_equal(res$fill$covered, "R-a")
+  expect_true("2026-06-14" %in% res$fill$days$date)
+  expect_setequal(unique(res$fill$rows$package), "R-a")
+})
+
+test_that("the import preview solves with the pipeline runs and counters a refill run will read", {
+  ids3 <- c(ids2, "R-x" = 3L)
+  truth <- with_outsider(fill_truth("2026-05-01", "2026-06-20"))
+  holes <- c("2026-06-09", "2026-06-12")
+  tmp <- withr::local_tempdir()
+  hist <- file.path(tmp, "history.db")
+  write_history_fixture(hist, truth[truth$package != "R-x", ], ids2, "2026-06-11")
+  daily <- truth[truth$count > 0 & truth$date <= "2026-06-19" & !(truth$date %in% holes), ]
+  recent <- file.path(tmp, "recent.db")
+  export_shard(recent, daily, days_df = bootstrap_days(daily))
+  real <- snapshot_fixture(truth, ids3, "2026-06-20", source = "run", hour = 4L)
+  write_runs(recent, real$run)
+  cpath <- file.path(tmp, COUNTERS_ASSET)
+  update_counters(cpath, real$cn[names(empty_counters())], keep_from = 0L, fresh = TRUE)
+  source(file.path(.ao_root, "scripts", "import_release_snapshots.R"))
+
+  capture.output(alone <- import_release_snapshots(hist, recent, file.path(tmp, "o1")))
+  expect_equal(alone$fill$days$date, "2026-06-09")          # the snapshot's 7 days hold only this hole
+  out <- capture.output(both <- import_release_snapshots(hist, recent, file.path(tmp, "o2"), cpath))
+  expect_true(any(grepl("with 1 pipeline run from the counters asset", out)))
+  expect_setequal(both$fill$days$date, holes)               # 06-12 needs the pipeline run's 30 days
+  expect_equal(both$fill$rejected, 0L)
+  expect_false("R-x" %in% both$fill$rows$package)
+  m <- merge(both$fill$rows, truth, by = c("package", "date"))
+  expect_equal(m$count.x, m$count.y)
+})
