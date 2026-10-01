@@ -120,8 +120,9 @@ unix_to_date <- function(x) {
   format(as.POSIXct(as.numeric(x), origin = "1970-01-01", tz = "UTC"), "%Y-%m-%d")
 }
 
-# Write the daily-series table for one shard. daily_df has (package, date, count).
-export_shard <- function(path, daily_df) {
+# Write the daily-series table for one shard. daily_df has (package, date, count);
+# days_df, when given, is written as autoobs_days beside it.
+export_shard <- function(path, daily_df, days_df = NULL) {
   if (file.exists(path)) unlink(path)
   con <- DBI::dbConnect(RSQLite::SQLite(), path)
   on.exit(DBI::dbDisconnect(con), add = TRUE)
@@ -137,6 +138,7 @@ export_shard <- function(path, daily_df) {
     DBI::dbWriteTable(con, "autoobs_downloads_daily",
       daily_df[c("package", "date", "count")], append = TRUE)
   }
+  if (!is.null(days_df)) write_days(con, days_df)
   DBI::dbExecute(con, "VACUUM")
   invisible(NULL)
 }
@@ -309,6 +311,9 @@ RUNS_SCHEMA <- c(
   sum_30d            = "INTEGER",
   day_aggregated     = "INTEGER",
   window_end         = "TEXT",
+  days_filled        = "INTEGER",
+  fill_rejected      = "INTEGER",
+  window_residual    = "INTEGER",
   in_scope           = "INTEGER",
   counters_prior     = "TEXT",
   counters_published = "INTEGER")
@@ -570,4 +575,58 @@ write_release_notes <- function(path, manifest) {
     "```")
   writeLines(lines, path)
   invisible(NULL)
+}
+
+# autoobs_days: which dates hold data. A date absent here is a hole; a date with
+# no daily rows but a row here is a true zero ('upstream_missing').
+DAYS_DDL <- "CREATE TABLE autoobs_days (
+  date      TEXT PRIMARY KEY,
+  method    TEXT NOT NULL,
+  run_id    INTEGER,
+  packages  INTEGER,
+  downloads INTEGER)"
+
+empty_days <- function() data.frame(date = character(0), method = character(0),
+  run_id = integer(0), packages = integer(0), downloads = integer(0), stringsAsFactors = FALSE)
+
+write_days <- function(con, days) {
+  DBI::dbExecute(con, "DROP TABLE IF EXISTS autoobs_days")
+  DBI::dbExecute(con, DAYS_DDL)
+  if (nrow(days) > 0)
+    DBI::dbWriteTable(con, "autoobs_days", days[names(empty_days())], append = TRUE)
+}
+
+# NULL when the shard predates the table, so the caller can bootstrap it.
+read_days <- function(path) {
+  if (!file.exists(path)) return(NULL)
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  if (!"autoobs_days" %in% DBI::dbListTables(con)) return(NULL)
+  d <- DBI::dbReadTable(con, "autoobs_days")
+  d$run_id <- as.integer(d$run_id); d$packages <- as.integer(d$packages)
+  d$downloads <- as.integer(d$downloads)
+  d[names(empty_days())]
+}
+
+# One row per date for the given daily rows.
+day_rows <- function(daily, dates, method, run_id) {
+  if (length(dates) == 0) return(empty_days())
+  do.call(rbind, lapply(dates, function(d) {
+    x <- daily$count[daily$date == d]
+    data.frame(date = d, method = method, run_id = as.integer(run_id),
+               packages = length(x), downloads = as.integer(sum(x)), stringsAsFactors = FALSE)
+  }))
+}
+
+# Every date already in the series was stored from that run's cnt_1d.
+bootstrap_days <- function(daily) {
+  day_rows(daily, sort(unique(daily$date)), "cnt_1d", NA_integer_)
+}
+
+upsert_days <- function(days, new) {
+  all <- rbind(new, days)
+  all <- all[!duplicated(all$date), , drop = FALSE]
+  all <- all[order(all$date), , drop = FALSE]
+  rownames(all) <- NULL
+  all
 }

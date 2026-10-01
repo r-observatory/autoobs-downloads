@@ -172,3 +172,39 @@ test_that("a database without the counters table is not a readable counters asse
   DBI::dbDisconnect(con)
   expect_false(counters_readable(p))
 })
+
+test_that("bootstrap_days writes one cnt_1d row per stored date", {
+  d <- data.frame(package = c("R-a", "R-b", "R-a"), date = c("2026-06-01", "2026-06-01", "2026-06-03"),
+                  count = c(2L, 3L, 4L), stringsAsFactors = FALSE)
+  b <- bootstrap_days(d)
+  expect_equal(b$date, c("2026-06-01", "2026-06-03"))
+  expect_equal(b$method, c("cnt_1d", "cnt_1d"))
+  expect_true(all(is.na(b$run_id)))
+  expect_equal(b$packages, c(2L, 1L))
+  expect_equal(b$downloads, c(5L, 4L))
+})
+
+test_that("autoobs_days is written beside the daily rows and read back", {
+  p <- tempfile(fileext = ".db")
+  d <- data.frame(package = "R-a", date = "2026-06-01", count = 2L, stringsAsFactors = FALSE)
+  export_shard(p, d, days_df = rbind(bootstrap_days(d), data.frame(
+    date = "2026-06-02", method = "upstream_missing", run_id = 9L, packages = 0L,
+    downloads = 0L, stringsAsFactors = FALSE)))
+  back <- read_days(p)
+  expect_equal(back$date, c("2026-06-01", "2026-06-02"))
+  expect_equal(back$method, c("cnt_1d", "upstream_missing"))
+  expect_null(read_days(tempfile()))
+  q <- tempfile(fileext = ".db")
+  export_shard(q, d)                       # a shard without days has no autoobs_days
+  expect_null(read_days(q))
+  m <- upsert_days(back, data.frame(date = "2026-06-02", method = "window", run_id = 10L,
+                                    packages = 1L, downloads = 4L, stringsAsFactors = FALSE))
+  expect_equal(m$method, c("cnt_1d", "window"))     # a newer row for a date wins
+})
+
+test_that("the run record carries the fill columns", {
+  expect_true(all(c("days_filled", "fill_rejected", "window_residual") %in% names(RUNS_SCHEMA)))
+  n <- normalize_runs(data.frame(run_id = 5, days_filled = 2))
+  expect_equal(n$days_filled, 2L)
+  expect_true(is.na(n$fill_rejected))
+})
