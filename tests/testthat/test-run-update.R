@@ -821,3 +821,33 @@ test_that("a MirrorCache more than a week behind never has a day recorded as unc
   expect_false(anyNA(m$count.x))
   expect_equal(m$count.x, m$count.y)                 # every stored value is the truth
 })
+
+test_that("an unaggregated run leaves total_1d NULL and the summary has no rank_total", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  ids <- c("R-a" = 1L, "R-b" = 2L)
+  truth <- fill_truth("2026-06-01")
+  dates <- format(seq(as.Date("2026-06-02"), as.Date("2026-06-10"), by = "day"))
+  r <- run_days(pub, tmp, truth, ids, dates, unaggregated = "2026-06-10")
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(r$out, "autoobs-downloads-summary.db"))
+  on.exit(DBI::dbDisconnect(con))
+  s <- DBI::dbGetQuery(con, "SELECT total_1d, total_7d FROM autoobs_downloads_summary")
+  expect_true(all(is.na(s$total_1d)))
+  expect_true(all(s$total_7d > 0))
+  expect_false("rank_total" %in% DBI::dbListFields(con, "autoobs_downloads_summary"))
+})
+
+test_that("the manifest names the newest known day and the run's window facts", {
+  tmp <- withr::local_tempdir(); pub <- file.path(tmp, "pub"); dir.create(pub)
+  ids <- c("R-a" = 1L, "R-b" = 2L)
+  truth <- fill_truth("2026-06-01")
+  dates <- format(seq(as.Date("2026-06-02"), as.Date("2026-06-10"), by = "day"))
+  r <- run_days(pub, tmp, truth, ids, dates, unaggregated = "2026-06-10")
+  man <- jsonlite::fromJSON(file.path(r$out, "manifest.json"), simplifyVector = FALSE)
+  expect_equal(man$summary$latest_date, "2026-06-08")     # 06-09 is not counted yet
+  expect_equal(man$summary$snapshot_date, "2026-06-10")
+  expect_false(man$summary$day_aggregated)
+  expect_equal(man$summary$window_end, "2026-06-08")
+  expect_equal(man$summary$days_filled, 0L)
+  expect_match(paste(readLines(file.path(r$out, "release_notes.md")), collapse = "\n"),
+               "| **Latest day** | 2026-06-08 |", fixed = TRUE)
+})

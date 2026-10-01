@@ -346,7 +346,8 @@ run_update <- function(io, out_dir, force_full = FALSE,
     DBI::dbExecute(con, "CREATE TABLE autoobs_downloads_daily (package TEXT, date TEXT, count INTEGER)")
   }
   summary_df <- build_summary(con, stats_df, attribute_date, snap_str,
-                              identity_df = identity_df, autocran_map = cache)
+                              identity_df = identity_df, autocran_map = cache,
+                              day_aggregated = day_aggregated)
   rec$in_scope <- nrow(summary_df)
   rec$outcome  <- "ok"
   runs_all     <- merge_runs(runs_prev, run_row(rec))
@@ -393,8 +394,11 @@ run_update <- function(io, out_dir, force_full = FALSE,
       out_of_scope     = nrow(stats_df) - nrow(summary_df),
       raw_tracked      = nrow(stats_df),
       autocran_only    = sum(summary_df$autocran_only == 1L, na.rm = TRUE),
-      latest_date      = attribute_date,
+      latest_date      = if (nrow(days_all) > 0) max(days_all$date) else NULL,
       snapshot_date    = snap_str,
+      day_aggregated   = day_aggregated,
+      window_end       = rec$window_end,
+      days_filled      = rec$days_filled,
       daily_rows_today = nrow(daily_today)))
 
   # Integrity / completeness core for the summary DB the downstream merge pulls.

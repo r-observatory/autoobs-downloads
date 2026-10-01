@@ -18,7 +18,6 @@ build_summary_db <- function(n = 3L) {
     cnt_total      = seq_len(n) * 100L,
     avg_daily_30d  = seq_len(n) * 1.5,
     rank_30d       = seq_len(n),
-    rank_total     = seq_len(n),
     trend          = rep(NA_real_, n),
     autocran_only  = rep(1L, n),
     first_seen     = rep("2025-12-31", n),
